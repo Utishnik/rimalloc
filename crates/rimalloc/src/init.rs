@@ -291,13 +291,26 @@ fn td_cache_push(mem: OsMem) -> bool {
 
 static THREAD_KEY: AtomicUsize = AtomicUsize::new(usize::MAX);
 
+pub(crate) fn td_cache_lock() -> &'static core::sync::atomic::AtomicBool {
+    &TD_CACHE.lock
+}
+
 fn ensure_process_init() {
     static ONCE: AtomicUsize = AtomicUsize::new(0);
     if ONCE.swap(1, Ordering::AcqRel) == 0 {
-        let mut key: libc::pthread_key_t = 0;
         // SAFETY: valid out-pointer and destructor fn.
-        unsafe { libc::pthread_key_create(&mut key, Some(thread_done_callback)) };
-        THREAD_KEY.store(key as usize, Ordering::Release);
+        unsafe {
+            let mut key: libc::pthread_key_t = 0;
+            libc::pthread_key_create(&mut key, Some(thread_done_callback));
+            THREAD_KEY.store(key as usize, Ordering::Release);
+            // Hold every allocator lock across fork() so the child's
+            // snapshot of the global lists/bitmaps is consistent.
+            libc::pthread_atfork(
+                Some(crate::os::fork_prepare),
+                Some(crate::os::fork_release),
+                Some(crate::os::fork_release),
+            );
+        }
     }
 }
 

@@ -1261,6 +1261,19 @@ pub mod abandoned {
         COUNT.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn lock_for_fork() {
+        while LIST
+            .lock
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+    }
+    pub(crate) fn unlock_for_fork() {
+        LIST.lock.store(false, Ordering::Release);
+    }
+
     fn locked<R>(f: impl FnOnce() -> R) -> R {
         while LIST
             .lock

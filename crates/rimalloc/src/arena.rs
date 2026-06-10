@@ -430,3 +430,30 @@ pub fn try_purge(force: bool) {
         }
     }
 }
+
+/// fork() support: hold the reservation lock and every arena's claim lock
+/// across the fork so the child's bitmaps are consistent.
+pub(crate) fn lock_for_fork() {
+    while RESERVE_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    for arena in arenas() {
+        while arena
+            .claim_lock
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+pub(crate) fn unlock_for_fork() {
+    for arena in arenas() {
+        arena.claim_lock.store(false, Ordering::Release);
+    }
+    RESERVE_LOCK.store(false, Ordering::Release);
+}

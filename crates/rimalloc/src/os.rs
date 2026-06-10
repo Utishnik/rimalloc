@@ -549,3 +549,41 @@ pub unsafe fn unprotect(p: *mut u8, size: usize) {
     #[cfg(miri)]
     let _ = (p, size);
 }
+
+// ---------------------------------------------------------------------------
+// fork() handling
+// ---------------------------------------------------------------------------
+// fork() snapshots memory mid-flight: if another thread holds one of the
+// allocator's spinlocks at fork, the child would inherit a locked lock (and
+// a possibly half-edited list) forever. `prepare` acquires every global
+// lock so the snapshot is consistent; `parent`/`child` release them. Other
+// threads do not exist in the child, so their heaps/segments simply remain
+// abandoned-or-orphaned there (same policy as mimalloc).
+
+/// All global spinlocks, in a fixed acquisition order.
+fn fork_locks() -> [&'static AtomicBool; 2] {
+    [&CACHE.lock, crate::init::td_cache_lock()]
+}
+
+pub(crate) extern "C" fn fork_prepare() {
+    crate::segment::abandoned::lock_for_fork();
+    for l in fork_locks() {
+        while l
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+    }
+    crate::arena::lock_for_fork();
+}
+
+pub(crate) extern "C" fn fork_release() {
+    crate::arena::unlock_for_fork();
+    for l in fork_locks() {
+        l.store(false, Ordering::Release);
+    }
+    crate::segment::abandoned::unlock_for_fork();
+}
+
+use core::sync::atomic::AtomicBool;
