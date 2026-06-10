@@ -127,8 +127,13 @@ shadow model with per-block fill patterns (corruption shows up as pattern
 mismatches; the debug validators assert the Lean-proven invariants on
 every step, and ASan watches the borders). 200k runs clean.
 
+A second target (`heap_api`) fuzzes the first-class heap API: multi-heap
+allocation, `heap_delete` (blocks must survive absorption into the backing
+heap), `heap_destroy` (blocks die with the heap), and heap walks.
+
 ```
 cd crates/rimalloc && cargo +nightly fuzz run alloc_ops -- -rss_limit_mb=6144
+scripts/soak.sh 14400   # 4h soak across both targets, persistent corpus
 ```
 
 ## Concurrency model checking (loom)
