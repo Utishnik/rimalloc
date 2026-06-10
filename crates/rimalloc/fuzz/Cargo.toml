@@ -1,0 +1,21 @@
+[package]
+name = "rimalloc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rimalloc = { path = ".." }
+
+[[bin]]
+name = "alloc_ops"
+path = "fuzz_targets/alloc_ops.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

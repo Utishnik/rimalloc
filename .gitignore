@@ -1,3 +1,6 @@
 reference/
 target/
 verify/.lake/
+crates/rimalloc/fuzz/target/
+crates/rimalloc/fuzz/corpus/
+crates/rimalloc/fuzz/artifacts/

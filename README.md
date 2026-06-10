@@ -118,6 +118,19 @@ Stable Rust is supported (the `nightly` feature opts into raw
 - Secure mode (free-list encoding, guard pages), debug fill patterns.
 - Extend the Lean verification beyond the current proofs.
 
+## Fuzzing
+
+`crates/rimalloc/fuzz` holds a libFuzzer target (`alloc_ops`) that decodes
+fuzz input into allocator operation sequences — malloc/zalloc/calloc/free/
+realloc/aligned/collect across every size class and page kind — against a
+shadow model with per-block fill patterns (corruption shows up as pattern
+mismatches; the debug validators assert the Lean-proven invariants on
+every step, and ASan watches the borders). 200k runs clean.
+
+```
+cd crates/rimalloc && cargo +nightly fuzz run alloc_ops -- -rss_limit_mb=6144
+```
+
 ## Concurrency model checking (loom)
 
 The cross-thread delayed-free protocol — the one subsystem Lean cannot

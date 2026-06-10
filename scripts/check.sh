@@ -24,6 +24,13 @@ cargo miri test -p rimalloc
 echo "== loom model check (delayed-free protocol) =="
 LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS="--cfg loom" cargo test -p rimalloc --test loom_protocol --release
 
+echo "== fuzz (quick pass; full runs via cargo +nightly fuzz) =="
+if command -v cargo-fuzz >/dev/null 2>&1; then
+  (cd crates/rimalloc && cargo +nightly fuzz run alloc_ops -- -runs=20000 -max_len=2048 -rss_limit_mb=6144)
+else
+  echo "cargo-fuzz not installed; skipping"
+fi
+
 echo "== Lean proofs =="
 if command -v lake >/dev/null 2>&1 || [ -x "$HOME/.elan/bin/lake" ]; then
   PATH="$HOME/.elan/bin:$PATH" sh -c 'cd verify && lake build'
