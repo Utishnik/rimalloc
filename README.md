@@ -32,7 +32,9 @@ rimalloc::free(p);
 | `heap.c` | `heap_ops.rs` | collect, delete, destroy, absorb |
 | `init.c` | `init.rs` | TLS heaps, thread lifecycle |
 | `os.c`, `prim/unix` | `os.rs` | mmap/commit/purge + segment cache |
-| `options.c` | `options.rs` | env-configurable options |
+| `options.c` | `options.rs` | full get/set option API, env-configurable |
+| `arena.c` | `arena.rs` | 1GiB+ reservations, bitmap block claiming, lazy purge |
+| `stats.c` | `stats.rs` | process stats, `stats_print` (`stats` feature for per-alloc) |
 
 Key invariants (from `types.h`):
 - `used - |thread_free|` = live blocks in a page
@@ -64,6 +66,14 @@ Key invariants (from `types.h`):
 - [x] `GlobalAlloc` implementation
 - [x] Per-thread heaps, thread exit abandonment, segment reclamation
 - [x] Heap walking (`heap_visit_blocks` with a closure-based visitor)
+- [x] Arena layer: geometric 1GiB+ reservations, lock-free single-block
+      claims, batched lazy purge — segment churn is fully syscall-free
+- [x] Statistics (`stats_print`; per-allocation accounting behind the
+      `stats` feature, like `MI_STAT`)
+- [x] Options API (`options::get/set/enable/disable`, `MIMALLOC_*` env)
+- [x] Secure mode (`secure` feature): encoded free lists with per-page and
+      per-heap random keys, corrupted-list and double-free detection
+      (~5% overhead, mirroring `MI_SECURE=3/4`)
 - [x] Ported test suite: `test-api.c`, `test-api-fill.c`, `test-stress.c`
 - [x] Miri-clean on the ported suite
 - [x] Stress (32 threads × 50 iters): 0.66s vs C mimalloc v2.3.2's 0.62s
@@ -82,11 +92,11 @@ bundling C mimalloc **v3.3.2** and the macOS system allocator —
 
 ### Parity gaps / roadmap
 
-- **Arenas** (`arena.c`): mimalloc's 1GiB reserved arenas with bitmap
-  allocation; replaces the simpler segment cache, enables
-  `mi_reserve_os_memory`, NUMA affinity, delayed purge batching.
-- Statistics (`stats.c`), options table completeness, `mi_register_*` hooks.
-- `mi_heap_new_in_arena`, heap tags beyond the basics.
+- `mi_reserve_os_memory` / `mi_manage_os_memory`, NUMA affinity, huge OS
+  pages (1GiB), exclusive arenas, `mi_heap_new_in_arena`.
+- Guard pages (`MI_SECURE=5`) and debug fill patterns.
+- `mi_register_*` hooks (deferred free, output, error).
+- Page-granular purging inside live segments (C's remaining peak-RSS edge).
 - First-class heaps as a typed Rust API (`Heap` is already exposed).
 - Secure mode (free-list encoding, guard pages), debug fill patterns.
 - Extend the Lean verification beyond the current proofs.

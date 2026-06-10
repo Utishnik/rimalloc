@@ -459,6 +459,7 @@ pub fn heap_malloc_aligned(heap: &Heap, size: usize, alignment: usize) -> *mut u
 /// `mi_collect`
 pub fn collect(force: bool) {
     crate::heap_ops::heap_collect(heap_get_default(), force);
+    crate::arena::try_purge(force);
     if force {
         crate::os::cache_collect();
     }
@@ -653,4 +654,14 @@ pub fn abandoned_stats() -> (usize, usize, usize) {
 /// Diagnostics: number of initialized live threads.
 pub fn current_thread_count_dbg() -> usize {
     crate::init::current_thread_count()
+}
+
+/// `mi_stats_print`: write allocator statistics to stderr.
+pub fn stats_print() {
+    let _ = crate::stats::print(&mut std::io::stderr());
+}
+
+/// Write allocator statistics to an arbitrary writer.
+pub fn stats_write(out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    crate::stats::print(out)
 }

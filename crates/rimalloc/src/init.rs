@@ -272,6 +272,7 @@ pub fn thread_init() {
         DEFAULT_HEAP.set(heap);
     }
     THREAD_COUNT.fetch_add(1, Ordering::Relaxed);
+    crate::stats::STATS.threads.increase(1);
 
     let key = THREAD_KEY.load(Ordering::Acquire);
     if key != usize::MAX {
@@ -333,5 +334,6 @@ fn thread_done_with(heap: &Heap) {
         }
     }
     THREAD_COUNT.fetch_sub(1, Ordering::Relaxed);
+    crate::stats::STATS.threads.decrease(1);
     crate::os::drain_deferred();
 }

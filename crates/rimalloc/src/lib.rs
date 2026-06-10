@@ -20,17 +20,19 @@
 
 mod alloc;
 mod api;
+mod arena;
 mod bins;
 mod constants;
 mod free;
 mod heap;
 mod heap_ops;
 mod init;
-mod options;
+pub mod options;
 mod os;
 mod page;
 mod page_ops;
 mod segment;
+mod stats;
 mod visit;
 
 pub use api::*;

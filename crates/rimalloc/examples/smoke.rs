@@ -97,5 +97,6 @@ fn main() {
         rimalloc::free(p);
     }
     rimalloc::collect(true);
+    rimalloc::stats_print();
     println!("rimalloc smoke: OK");
 }

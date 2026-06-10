@@ -130,6 +130,9 @@ pub struct Page {
 
     pub next: Cell<*mut Page>,
     pub prev: Cell<*mut Page>,
+
+    /// Random keys encoding the free lists (`secure` feature; `MI_ENCODE_FREELIST`).
+    pub keys: [Cell<usize>; 2],
 }
 
 // SAFETY: pages are reachable from other threads, but those only touch the
@@ -140,6 +143,46 @@ unsafe impl Sync for Page {}
 
 /// A slice span header is the same struct viewed differently.
 pub type Slice = Page;
+
+/// Free-list pointer encoding (`mi_ptr_encode`/`mi_ptr_decode`): with the
+/// `secure` feature, next pointers are stored as
+/// `rotl(ptr ^ k1, k0 % BITS) + k0` with per-page (or per-heap) random
+/// keys, detecting corrupted lists and making overwrites useless to an
+/// attacker. `null` is substituted by the list owner's address so an
+/// encoded null is not a key oracle (like C).
+#[inline(always)]
+pub fn ptr_encode(null_sub: usize, p: *mut Block, keys: &[Cell<usize>; 2]) -> *mut Block {
+    if cfg!(feature = "secure") {
+        let x = if p.is_null() { null_sub } else { p.addr() };
+        let (k0, k1) = (keys[0].get(), keys[1].get());
+        ptr::with_exposed_provenance_mut(
+            (x ^ k1)
+                .rotate_left((k0 % usize::BITS as usize) as u32)
+                .wrapping_add(k0),
+        )
+    } else {
+        p
+    }
+}
+
+#[inline(always)]
+pub fn ptr_decode(null_sub: usize, enc: *mut Block, keys: &[Cell<usize>; 2]) -> *mut Block {
+    if cfg!(feature = "secure") {
+        let (k0, k1) = (keys[0].get(), keys[1].get());
+        let x = enc
+            .addr()
+            .wrapping_sub(k0)
+            .rotate_right((k0 % usize::BITS as usize) as u32)
+            ^ k1;
+        if x == null_sub {
+            ptr::null_mut()
+        } else {
+            ptr::with_exposed_provenance_mut(x)
+        }
+    } else {
+        enc
+    }
+}
 
 impl Page {
     #[allow(clippy::declare_interior_mutable_const)] // template value, never read in place
@@ -166,6 +209,7 @@ impl Page {
         xheap: AtomicUsize::new(0),
         next: Cell::new(ptr::null_mut()),
         prev: Cell::new(ptr::null_mut()),
+        keys: [Cell::new(0), Cell::new(0)],
     };
 
     /// `_mi_page_segment`: pages live inside their segment, so mask the address.
@@ -267,5 +311,28 @@ impl Page {
     #[inline(always)]
     pub fn slice_is_used(&self) -> bool {
         self.block_size.get() > 0
+    }
+
+    /// `mi_block_next`: read a block's next pointer (decoding under `secure`).
+    ///
+    /// # Safety
+    /// `b` must be a live free-list node of this page.
+    #[inline(always)]
+    pub unsafe fn block_next(&self, b: *mut Block) -> *mut Block {
+        // SAFETY: per contract.
+        let raw = unsafe { (*b).next.get() };
+        ptr_decode(ptr::from_ref(self).addr(), raw, &self.keys)
+    }
+
+    /// `mi_block_set_next`: link a block into one of this page's free lists
+    /// (write-only: the block's memory may be uninitialized).
+    ///
+    /// # Safety
+    /// `b` must point to block-sized memory of this page owned by the caller.
+    #[inline(always)]
+    pub unsafe fn block_set_next(&self, b: *mut Block, next: *mut Block) {
+        let enc = ptr_encode(ptr::from_ref(self).addr(), next, &self.keys);
+        // SAFETY: per contract.
+        unsafe { Block::write_next(b, enc) };
     }
 }

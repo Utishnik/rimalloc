@@ -4,6 +4,7 @@ use core::ptr::{self, NonNull};
 
 use crate::constants::*;
 use crate::heap::{Heap, heap_get_free_small_page};
+use crate::page::Block;
 use crate::page::Page;
 use crate::page_ops::malloc_generic;
 
@@ -13,13 +14,11 @@ use crate::page_ops::malloc_generic;
 pub fn page_malloc_zero(heap: &Heap, page: &Page, size: usize, zero: bool) -> Option<NonNull<u8>> {
     debug_assert!(page.block_size.get() == 0 || page.block_size() >= size);
     let block = page.free.get();
-    let Some(block_ref) = (
-        // SAFETY: free-list nodes are free blocks in this page.
-        unsafe { block.as_ref() }
-    ) else {
+    if block.is_null() {
         return malloc_generic(heap, size, zero, 0);
-    };
-    page.free.set(block_ref.next.get());
+    }
+    // SAFETY: free-list nodes are live blocks of this page.
+    page.free.set(unsafe { page.block_next(block) });
     page.used.set(page.used.get() + 1);
     debug_assert!(
         page.block_size() < MAX_ALIGN_SIZE || block.addr().is_multiple_of(MAX_ALIGN_SIZE)
@@ -28,7 +27,8 @@ pub fn page_malloc_zero(heap: &Heap, page: &Page, size: usize, zero: bool) -> Op
     if zero {
         debug_assert!(page.block_size.get() != 0);
         if page.free_is_zero.get() {
-            block_ref.next.set(ptr::null_mut());
+            // SAFETY: the block is exclusively ours; clear the list word.
+            unsafe { Block::write_next(block, ptr::null_mut()) };
         } else {
             // SAFETY: the block is block_size bytes, exclusively ours now.
             unsafe { ptr::write_bytes(block.cast::<u8>(), 0, page.block_size()) };

@@ -96,9 +96,9 @@ fn page_thread_free_collect(page: &Page) {
     // Find the tail and count (bounded by capacity to catch corruption).
     let max_count = page.capacity.get() as usize;
     let mut count = 1;
-    let mut tail = head_ref;
+    let mut tail = head;
     // SAFETY: list nodes are free blocks in this page.
-    while let Some(next) = unsafe { tail.next.get().as_ref() } {
+    while let Some(next) = unsafe { page.block_next(tail).as_mut() } {
         if count > max_count {
             break;
         }
@@ -109,7 +109,9 @@ fn page_thread_free_collect(page: &Page) {
         crate::error("corrupted thread-free list");
         return;
     }
-    tail.next.set(page.local_free.get());
+    let _ = head_ref;
+    // SAFETY: tail is a live node of this page.
+    unsafe { page.block_set_next(tail, page.local_free.get()) };
     page.local_free.set(head);
     page.used.set(page.used.get() - count as u16);
 }
@@ -129,10 +131,10 @@ pub fn page_free_collect(page: &Page, force: bool) {
             // SAFETY: list nodes are free blocks in this page.
             unsafe {
                 let mut tail = page.local_free.get();
-                while !(*tail).next.get().is_null() {
-                    tail = (*tail).next.get();
+                while !page.block_next(tail).is_null() {
+                    tail = page.block_next(tail);
                 }
-                (*tail).next.set(page.free.get());
+                page.block_set_next(tail, page.free.get());
             }
             page.free.set(page.local_free.get());
             page.local_free.set(ptr::null_mut());
@@ -167,6 +169,7 @@ fn page_fresh_alloc<'a>(
         block_size
     };
     page_init(heap, page, full_block_size);
+    crate::stats::STATS.pages.increase(1);
     if let Some(pq) = pq {
         heap.page_queue_push(pq, page);
     }
@@ -200,13 +203,17 @@ pub fn heap_delayed_free_partial(heap: &Heap) -> bool {
     let mut all_freed = true;
     // SAFETY: delayed-free blocks are free blocks owned by this heap's pages.
     while let Some(b) = unsafe { block.as_ref() } {
-        let next = b.next.get();
+        let next = crate::page::ptr_decode(ptr::from_ref(heap).addr(), b.next.get(), &heap.keys);
         if !crate::free::free_delayed_block(block) {
             // another thread still holds DELAYED_FREEING: requeue
             all_freed = false;
             let mut dfree = heap.thread_delayed_free.load(Ordering::Relaxed);
             loop {
-                b.next.set(dfree);
+                b.next.set(crate::page::ptr_encode(
+                    ptr::from_ref(heap).addr(),
+                    dfree,
+                    &heap.keys,
+                ));
                 match heap.thread_delayed_free.compare_exchange_weak(
                     dfree,
                     block,
@@ -376,11 +383,11 @@ fn page_free_list_extend(page: &Page, bsize: usize, extend: usize) {
         // memory is uninitialized.
         let next = unsafe { block.cast::<u8>().add(bsize).cast::<Block>() };
         // SAFETY: `block` is a fresh allocator-owned block.
-        unsafe { Block::write_next(block, next) };
+        unsafe { page.block_set_next(block, next) };
         block = next;
     }
     // SAFETY: last is a fresh block; prepend to the existing free list.
-    unsafe { Block::write_next(last, page.free.get()) };
+    unsafe { page.block_set_next(last, page.free.get()) };
     page.free.set(start);
 }
 
@@ -408,6 +415,9 @@ pub fn page_extend_free(page: &Page) -> bool {
         (MAX_EXTEND_SIZE / bsize).max(MIN_EXTEND)
     };
     extend = extend.min(max_extend);
+    crate::stats::STATS
+        .pages_extended
+        .fetch_add(1, Ordering::Relaxed);
     page_free_list_extend(page, bsize, extend);
     page.capacity.set(page.capacity.get() + extend as u16);
     true
@@ -425,6 +435,8 @@ fn page_init(heap: &Heap, page: &Page, block_size: usize) {
     page.reserved.set((page_size / block_size) as u16);
     debug_assert!(page.reserved.get() > 0);
     page.free_is_zero.set(page.is_zero_init.get());
+    page.keys[0].set(crate::init::random_next() | 1);
+    page.keys[1].set(crate::init::random_next() | 1);
     page.block_size_shift.set(if block_size.is_power_of_two() {
         block_size.trailing_zeros() as u8
     } else {
@@ -601,6 +613,7 @@ pub fn malloc_generic(
     debug_assert!(page.immediate_available());
     debug_assert!(page.block_size() >= size);
 
+    crate::stats::stat_malloc(page.usable_block_size(), page.is_huge.get());
     let p = crate::alloc::page_malloc_zero(heap, page, size, zero);
     if page.reserved.get() == page.used.get() {
         page_to_full(page, heap.page_queue_of(page));

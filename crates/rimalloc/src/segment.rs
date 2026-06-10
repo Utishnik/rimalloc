@@ -144,10 +144,18 @@ impl CommitMask {
     }
 }
 
-/// Provenance of segment memory (`mi_memid_t`, OS-only until arenas land).
+/// Where a segment's memory came from (`mi_memkind_t`).
+#[derive(Clone, Copy, Debug)]
+pub enum MemSource {
+    Os,
+    Arena(crate::arena::ArenaRef),
+}
+
+/// Provenance of segment memory (`mi_memid_t`).
 #[derive(Clone, Copy, Debug)]
 pub struct MemId {
     pub mem: OsMem,
+    pub source: MemSource,
     pub is_pinned: bool,
     pub initially_committed: bool,
     pub initially_zero: bool,
@@ -521,6 +529,15 @@ impl SegmentsTld {
     }
 
     fn track_size(&self, delta: isize) {
+        if delta >= 0 {
+            crate::stats::STATS.segments.increase(1);
+            crate::stats::STATS.reserved.increase(delta as usize);
+            crate::stats::STATS.committed.increase(delta as usize);
+        } else {
+            crate::stats::STATS.segments.decrease(1);
+            crate::stats::STATS.reserved.decrease((-delta) as usize);
+            crate::stats::STATS.committed.decrease((-delta) as usize);
+        }
         let count = self.count.get();
         self.count.set(count.wrapping_add_signed(delta.signum()));
         self.peak_count
@@ -788,6 +805,44 @@ fn segment_os_alloc<'a>(
         (segment_slices, _) = calculate_slices(required + extra);
     }
     let segment_size = segment_slices * SEGMENT_SLICE_SIZE;
+    // Prefer the arenas for standard-aligned allocations (syscall-free
+    // reuse, batched purging); fall back to the OS segment cache / mmap.
+    if align_offset == 0
+        && alignment == SEGMENT_ALIGN
+        && segment_size.is_multiple_of(crate::arena::ARENA_BLOCK_SIZE)
+        && let Some((p, is_zero, aref)) =
+            crate::arena::alloc(segment_size / crate::arena::ARENA_BLOCK_SIZE)
+    {
+        let mem = OsMem {
+            base: p,
+            size: segment_size,
+            align: alignment,
+            is_committed: true,
+            is_zero,
+        };
+        if !is_zero {
+            // SAFETY: header zeroing before &Segment creation (see below).
+            unsafe { ptr::write_bytes(p, 0, size_of::<Segment>()) };
+        }
+        // SAFETY: aligned, committed, header zeroed/zero.
+        let segment: &Segment = unsafe { &*p.cast() };
+        segment.commit_mask.set_full();
+        segment.memid.set(MemId {
+            mem,
+            source: MemSource::Arena(aref),
+            is_pinned: false,
+            initially_committed: true,
+            initially_zero: is_zero,
+        });
+        segment.allow_decommit.set(true);
+        segment.allow_purge.set(options::purge_delay() >= 0);
+        segment.segment_size.set(segment_size);
+        segment.purge_expire.set(0);
+        segment.purge_mask.clear_all();
+        segment.free_is_zero.set(is_zero);
+        tld.track_size(segment_size as isize);
+        return Some((segment, segment_slices));
+    }
     // Allocate so that `base + align_offset` is `alignment`-aligned.
     let (p, mem) = if align_offset == 0 {
         if segment_size == SEGMENT_SIZE
@@ -829,6 +884,7 @@ fn segment_os_alloc<'a>(
     }
     segment.memid.set(MemId {
         mem,
+        source: MemSource::Os,
         is_pinned: false,
         initially_committed: mem.is_committed,
         initially_zero: mem.is_zero,
@@ -903,12 +959,23 @@ fn segment_os_free(segment: &Segment, tld: &SegmentsTld) {
         tld.reclaim_count.set(tld.reclaim_count.get() - 1);
         segment.was_reclaimed.set(false);
     }
-    // Cache standard segments for syscall-free reuse; otherwise defer the
-    // unmap since references into the segment may still be on the call stack.
-    let mem = segment.memid.get().mem;
-    let standard = mem.size == SEGMENT_SIZE && mem.base.addr() & SEGMENT_MASK == 0;
-    if !os::cache_push(mem, standard) {
-        os::defer_free(mem);
+    let memid = segment.memid.get();
+    match memid.source {
+        MemSource::Arena(aref) => {
+            // Returning blocks only flips bitmap bits — no dealloc happens
+            // while references into the segment are still on the stack.
+            crate::arena::free(aref);
+        }
+        MemSource::Os => {
+            // Cache standard segments for syscall-free reuse; otherwise
+            // defer the unmap since references into the segment may still
+            // be on the call stack.
+            let mem = memid.mem;
+            let standard = mem.size == SEGMENT_SIZE && mem.base.addr() & SEGMENT_MASK == 0;
+            if !os::cache_push(mem, standard) {
+                os::defer_free(mem);
+            }
+        }
     }
 }
 
@@ -964,6 +1031,7 @@ impl Segment {
         page.next.set(ptr::null_mut());
         page.prev.set(ptr::null_mut());
 
+        crate::stats::STATS.pages.decrease(1);
         let slice = self.span_free_coalesce(page, tld);
         self.used.set(self.used.get() - 1);
         self.free_is_zero.set(false);
@@ -1003,6 +1071,9 @@ impl Segment {
 
         self.try_purge(options::abandoned_page_purge() == 1);
 
+        crate::stats::STATS
+            .segments_abandoned
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         tld.track_size(-(self.size() as isize));
         self.thread_id.store(0, Ordering::Release);
         self.abandoned_visits.set(1);

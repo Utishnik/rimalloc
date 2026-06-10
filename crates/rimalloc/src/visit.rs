@@ -81,13 +81,13 @@ fn area_visit_blocks(
         free_map[bmapsize - 1] = usize::MAX << (capacity % usize::BITS as usize);
     }
     let mut p = page.free.get();
-    // SAFETY: free-list nodes are live blocks in this page.
-    while let Some(block) = unsafe { p.as_ref() } {
+    while !p.is_null() {
         let offset = p.addr() - pstart.addr();
         debug_assert!(offset.is_multiple_of(bsize));
         let blockidx = offset / bsize;
         free_map[blockidx / usize::BITS as usize] |= 1 << (blockidx % usize::BITS as usize);
-        p = block.next.get();
+        // SAFETY: free-list nodes are live blocks in this page.
+        p = unsafe { page.block_next(p) };
     }
 
     // walk all blocks, skipping the free ones

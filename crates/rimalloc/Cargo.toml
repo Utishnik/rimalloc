@@ -13,6 +13,9 @@ libc = { version = "0.2", default-features = false }
 default = []
 # Maintain allocation statistics (MI_STAT).
 stats = []
+# Security mitigations (MI_SECURE 3/4): encoded free lists with per-page
+# random keys, corrupted-list and double-free detection.
+secure = []
 
 [lints]
 workspace = true

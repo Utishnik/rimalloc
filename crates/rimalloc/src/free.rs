@@ -8,12 +8,61 @@ use crate::page::{Block, Delayed, Page, ThreadFree};
 use crate::page_ops;
 use crate::segment::{Segment, SegmentKind, ptr_segment};
 
+/// `mi_check_is_double_free` (`secure` feature): if the block's first word
+/// decodes to a plausible pointer into the same page, confirm by walking
+/// the page's free lists for an exact match (like C). Reads one word of
+/// possibly-uninitialized user memory exactly like C; not run under Miri.
+#[cfg(all(feature = "secure", not(miri)))]
+fn check_is_double_free(page: &Page, block: *mut Block) -> bool {
+    // SAFETY: block points into the page's committed area.
+    let n = unsafe { page.block_next(block) };
+    let start = page.page_start.get().addr();
+    let end = start + page.capacity.get() as usize * page.block_size();
+    let suspicious = n.addr() % size_of::<usize>() == 0
+        && (n.is_null() || (n.addr() >= start && n.addr() < end));
+    if !suspicious {
+        return false;
+    }
+    // confirm: is `block` actually on one of the free lists?
+    let on_list = |mut p: *mut Block| {
+        let mut count = page.capacity.get() as usize;
+        while !p.is_null() && count > 0 {
+            if p == block {
+                return true;
+            }
+            // SAFETY: list nodes are live blocks of this page.
+            unsafe {
+                p = page.block_next(p);
+            }
+            count -= 1;
+        }
+        false
+    };
+    if on_list(page.free.get())
+        || on_list(page.local_free.get())
+        || on_list(page.thread_free().block())
+    {
+        crate::error("double free detected");
+        return true;
+    }
+    false
+}
+
+#[cfg(not(all(feature = "secure", not(miri))))]
+#[inline(always)]
+fn check_is_double_free(_page: &Page, _block: *mut Block) -> bool {
+    false
+}
+
 /// `mi_free_block_local`: thread-local free; push on `local_free`.
 #[inline(always)]
 fn free_block_local(page: &Page, block: *mut Block, check_full: bool) {
+    if check_is_double_free(page, block) {
+        return;
+    }
     // SAFETY: the caller owns this (possibly partially-initialized) block;
     // write-only, as the old contents may be uninitialized.
-    unsafe { Block::write_next(block, page.local_free.get()) };
+    unsafe { page.block_set_next(block, page.local_free.get()) };
     page.local_free.set(block);
     let used = page.used.get() - 1;
     page.used.set(used);
@@ -57,7 +106,7 @@ fn free_block_delayed_mt(page: &Page, block: *mut Block) {
         } else {
             // SAFETY: we own the dying block; write-only (contents may be
             // uninitialized user memory).
-            unsafe { Block::write_next(block, ThreadFree(tfree).block()) };
+            unsafe { page.block_set_next(block, ThreadFree(tfree).block()) };
             block.expose_provenance() | (tfree & 3)
         };
         match page.xthread_free.compare_exchange_weak(
@@ -81,8 +130,10 @@ fn free_block_delayed_mt(page: &Page, block: *mut Block) {
         {
             let mut dfree = heap.thread_delayed_free.load(Ordering::Relaxed);
             loop {
-                // SAFETY: we own the dying block; write-only.
-                unsafe { Block::write_next(block, dfree) };
+                let enc = crate::page::ptr_encode(ptr::from_ref(heap).addr(), dfree, &heap.keys);
+                // SAFETY: we own the dying block; write-only. The heap
+                // delayed list is encoded with the heap's keys (like C).
+                unsafe { Block::write_next(block, enc) };
                 match heap.thread_delayed_free.compare_exchange_weak(
                     dfree,
                     block,
