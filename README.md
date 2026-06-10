@@ -89,6 +89,12 @@ bundling C mimalloc **v3.3.2** and the macOS system allocator —
 | mixed (random sizes, 100k slots) | **0.336s** | 0.414s | 0.945s |
 | xthread (producer/consumer) | **0.178s** | 0.189s | 0.255s |
 | threads (thread churn) | **0.058s** | 0.067s | 0.120s |
+| json (serde_json parse+walk+serialize, 8 threads, compiled-in) | **0.310s** | 0.346s | 0.584s |
+| regex (control: allocator-insensitive) | 0.040s | 0.041s | 0.042s |
+
+Stable Rust is supported (the `nightly` feature opts into raw
+`#[thread_local]` TLS, ~3-5% faster); `fork()` is handled via
+`pthread_atfork` lock ordering and tested under multithreaded load.
 
 - [x] `reserve_os_memory` / `manage_os_memory` (adopt external memory),
       exclusive arenas, `heap_new_in_arena` / `heap_new_ex` (heap tags),

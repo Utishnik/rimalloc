@@ -102,6 +102,90 @@ fn bench_threads() -> f64 {
     start.elapsed().as_secs_f64()
 }
 
+/// Real workload: build a large JSON document, then parse + tree-walk +
+/// re-serialize it repeatedly across threads (serde_json is intensely
+/// allocation-heavy: Maps, Vecs, Strings of every size class).
+fn bench_json() -> f64 {
+    let mut doc = String::from("[");
+    let mut r = 7usize;
+    for i in 0..20_000 {
+        if i > 0 {
+            doc.push(',');
+        }
+        doc.push_str(&format!(
+            r#"{{"id":{i},"name":"user-{i}-{}","tags":["a","bb","ccc","dddd"],"nested":{{"x":{},"y":[1,2,3,4,5,6,7,8],"s":"{}"}}}}"#,
+            pick(&mut r) % 1000,
+            pick(&mut r) % 100_000,
+            "padding-".repeat(pick(&mut r) % 8 + 1),
+        ));
+    }
+    doc.push(']');
+
+    let start = Instant::now();
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let doc = doc.clone();
+            std::thread::spawn(move || {
+                let mut total = 0usize;
+                for _ in 0..12 {
+                    let v: serde_json::Value = serde_json::from_str(&doc).unwrap();
+                    // walk the tree (touch every allocation)
+                    fn walk(v: &serde_json::Value) -> usize {
+                        match v {
+                            serde_json::Value::Array(a) => a.iter().map(walk).sum::<usize>() + 1,
+                            serde_json::Value::Object(o) => {
+                                o.values().map(walk).sum::<usize>() + o.len()
+                            }
+                            serde_json::Value::String(s) => s.len(),
+                            _ => 1,
+                        }
+                    }
+                    total += walk(&v);
+                    total += serde_json::to_string(&v).unwrap().len();
+                }
+                total
+            })
+        })
+        .collect();
+    for h in handles {
+        std::hint::black_box(h.join().unwrap());
+    }
+    start.elapsed().as_secs_f64()
+}
+
+/// Real workload: regex compilation + scanning (compilation allocates DFA
+/// state machines; scanning allocates capture vectors).
+fn bench_regex() -> f64 {
+    let mut hay = String::new();
+    let mut r = 99usize;
+    for i in 0..200_000 {
+        hay.push_str(&format!(
+            "line {i} value={} key=k{} ",
+            pick(&mut r) % 9973,
+            i % 511
+        ));
+    }
+    let start = Instant::now();
+    let handles: Vec<_> = (0..8)
+        .map(|t| {
+            let hay = hay.clone();
+            std::thread::spawn(move || {
+                let mut n = 0usize;
+                for i in 0..6 {
+                    let re = regex::Regex::new(&format!(r"value=(\d+{}) key=(k\d+)", (t + i) % 10))
+                        .unwrap();
+                    n += re.captures_iter(&hay).count();
+                }
+                n
+            })
+        })
+        .collect();
+    for h in handles {
+        std::hint::black_box(h.join().unwrap());
+    }
+    start.elapsed().as_secs_f64()
+}
+
 fn main() {
     let which = std::env::args().nth(1).unwrap_or_else(|| "all".into());
     let name = if cfg!(feature = "alloc-rimalloc") {
@@ -121,4 +205,6 @@ fn main() {
     run("mixed", bench_mixed);
     run("xthread", bench_xthread);
     run("threads", bench_threads);
+    run("json", bench_json);
+    run("regex", bench_regex);
 }
