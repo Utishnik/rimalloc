@@ -1,3 +1,4 @@
+#![cfg_attr(feature = "nightly", feature(thread_local))]
 //! # rimalloc
 //!
 //! A pure-Rust port of [mimalloc](https://github.com/microsoft/mimalloc)
@@ -14,8 +15,6 @@
 //! rimalloc::free(p);
 //! ```
 
-#![feature(thread_local)]
-#![feature(ptr_mask)]
 #![allow(clippy::missing_safety_doc)]
 
 mod alloc;

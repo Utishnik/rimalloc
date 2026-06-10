@@ -16,15 +16,13 @@ use crate::os::OsMem;
 /// (leaking blocks onto the dying heap's delayed list).
 #[inline(always)]
 pub fn thread_id() -> usize {
-    #[thread_local]
-    static TID: Cell<usize> = Cell::new(0);
-    let t = TID.get();
+    let t = tls::TID.get();
     if t != 0 {
         return t;
     }
     // SAFETY: always callable; on macOS this is a thread-register read.
     let t = unsafe { libc::pthread_self() as usize };
-    TID.set(t);
+    tls::TID.set(t);
     t
 }
 
@@ -88,20 +86,79 @@ fn empty_heap() -> *mut Heap {
     ptr::from_ref(&EMPTY_HEAP.0).cast_mut()
 }
 
-#[thread_local]
-static DEFAULT_HEAP: Cell<*mut Heap> = Cell::new((&raw const EMPTY_HEAP.0).cast_mut());
+/// The allocator's three thread-local slots. Stable Rust uses
+/// const-initialized `thread_local!` (correct everywhere, ~1ns per access
+/// through `LocalKey`); the opt-in `nightly` feature uses raw
+/// `#[thread_local]` statics for direct TLS loads on the malloc/free fast
+/// paths.
+#[cfg(not(feature = "nightly"))]
+mod tls {
+    use super::*;
 
-/// `mi_prim_get_default_heap`: branch-free, like C (the empty heap makes
-/// the fast path fall into `malloc_generic`, which initializes the thread).
+    pub struct Slot<T: 'static>(&'static std::thread::LocalKey<Cell<T>>);
+    impl<T: Copy> Slot<T> {
+        #[inline(always)]
+        pub fn get(&self) -> T {
+            self.0.with(Cell::get)
+        }
+        #[inline(always)]
+        pub fn set(&self, v: T) {
+            self.0.with(|c| c.set(v))
+        }
+    }
+
+    thread_local! {
+        static TID_KEY: Cell<usize> = const { Cell::new(0) };
+        static HEAP_KEY: Cell<*mut Heap> =
+            const { Cell::new((&raw const EMPTY_HEAP.0).cast_mut()) };
+        static RNG_KEY: Cell<u64> = const { Cell::new(0) };
+    }
+    pub static TID: Slot<usize> = Slot(&TID_KEY);
+    pub static DEFAULT_HEAP: Slot<*mut Heap> = Slot(&HEAP_KEY);
+    pub static RNG: Slot<u64> = Slot(&RNG_KEY);
+}
+
+#[cfg(feature = "nightly")]
+mod tls {
+    use super::*;
+
+    #[thread_local]
+    static TID_RAW: Cell<usize> = Cell::new(0);
+    #[thread_local]
+    static HEAP_RAW: Cell<*mut Heap> = Cell::new((&raw const EMPTY_HEAP.0).cast_mut());
+    #[thread_local]
+    static RNG_RAW: Cell<u64> = Cell::new(0);
+
+    macro_rules! slot {
+        ($name:ident, $ty:ty, $raw:ident, $slot:ident) => {
+            pub struct $name;
+            impl $name {
+                #[inline(always)]
+                pub fn get(&self) -> $ty {
+                    $raw.get()
+                }
+                #[inline(always)]
+                pub fn set(&self, v: $ty) {
+                    $raw.set(v)
+                }
+            }
+            pub static $slot: $name = $name;
+        };
+    }
+    slot!(TidSlot, usize, TID_RAW, TID);
+    slot!(HeapSlot, *mut Heap, HEAP_RAW, DEFAULT_HEAP);
+    slot!(RngSlot, u64, RNG_RAW, RNG);
+}
+
 #[inline(always)]
 pub fn heap_default_unchecked() -> &'static Heap {
     // SAFETY: always the static empty heap or this thread's live heap.
-    unsafe { &*DEFAULT_HEAP.get() }
+    unsafe { &*tls::DEFAULT_HEAP.get() }
 }
 
 #[inline(always)]
 pub fn thread_is_initialized() -> bool {
-    DEFAULT_HEAP.get() != empty_heap()
+    tls::DEFAULT_HEAP.get() != empty_heap()
 }
 
 /// `mi_heap_get_default`: initializes the thread if needed.
@@ -115,7 +172,7 @@ pub fn heap_default() -> &'static Heap {
 
 pub fn heap_set_default(heap: &Heap) -> &'static Heap {
     let old = heap_default();
-    DEFAULT_HEAP.set(ptr::from_ref(heap).cast_mut());
+    tls::DEFAULT_HEAP.set(ptr::from_ref(heap).cast_mut());
     old
 }
 
@@ -138,14 +195,12 @@ pub fn current_thread_count() -> usize {
 
 // Simple wyrand-style RNG for cookies/keys (free lists are not encoded).
 pub fn random_next() -> usize {
-    #[thread_local]
-    static STATE: Cell<u64> = Cell::new(0);
-    let mut s = STATE.get();
+    let mut s = tls::RNG.get();
     if s == 0 {
         s = thread_id() as u64 ^ 0x9e37_79b9_7f4a_7c15 ^ (options_entropy() << 1) | 1;
     }
     s = s.wrapping_add(0xa076_1d64_78bd_642f);
-    STATE.set(s);
+    tls::RNG.set(s);
     let t = (s as u128).wrapping_mul((s ^ 0xe703_7ed1_a0b4_28db) as u128);
     ((t >> 64) ^ t) as usize
 }
@@ -281,7 +336,7 @@ pub fn thread_init() {
         let tld = &raw mut (*td).tld;
         (*tld).heap_backing.set(heap);
         crate::heap_ops::heap_init(&*heap, tld, false, 0, 0);
-        DEFAULT_HEAP.set(heap);
+        tls::DEFAULT_HEAP.set(heap);
     }
     THREAD_COUNT.fetch_add(1, Ordering::Relaxed);
     crate::stats::STATS.threads.increase(1);
@@ -290,7 +345,9 @@ pub fn thread_init() {
     if key != usize::MAX {
         // SAFETY: key was created in ensure_process_init; the value is the
         // backing heap pointer, handed to the destructor at thread exit.
-        unsafe { libc::pthread_setspecific(key as libc::pthread_key_t, DEFAULT_HEAP.get().cast()) };
+        unsafe {
+            libc::pthread_setspecific(key as libc::pthread_key_t, tls::DEFAULT_HEAP.get().cast())
+        };
     }
 }
 
@@ -308,7 +365,7 @@ fn thread_done_with(heap: &Heap) {
     if !heap.is_initialized() {
         return; // already done
     }
-    DEFAULT_HEAP.set(empty_heap());
+    tls::DEFAULT_HEAP.set(empty_heap());
     // Clear the TSD value so the destructor does not fire again on a heap
     // we are about to free.
     let key = THREAD_KEY.load(Ordering::Acquire);

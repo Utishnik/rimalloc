@@ -19,6 +19,9 @@ secure = []
 # Debug fill patterns (MI_DEBUG): stamp 0xD0 over fresh blocks and 0xDF
 # over freed blocks to surface use-of-uninitialized and use-after-free.
 debug-fill = []
+# Raw `#[thread_local]` statics for the hot-path TLS slots (requires a
+# nightly compiler); the default stable path uses `thread_local!`.
+nightly = []
 
 [lints]
 workspace = true
