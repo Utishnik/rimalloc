@@ -4,11 +4,11 @@
 
 use core::cell::Cell;
 use core::ptr;
-use core::sync::atomic::AtomicPtr;
+use core::sync::atomic::AtomicUsize;
 
 use crate::bins::{BIN_WSIZE, Bin};
 use crate::constants::*;
-use crate::page::{Block, Page};
+use crate::page::Page;
 use crate::segment::SegmentsTld;
 
 /// `mi_page_queue_t`: doubly-linked queue of pages of one block size.
@@ -62,7 +62,8 @@ impl Tld {
 #[repr(C)]
 pub struct Heap {
     pub tld: Cell<*mut Tld>,
-    pub thread_delayed_free: AtomicPtr<Block>,
+    /// Exposed-address head of the delayed-free list (`*mut Block`).
+    pub thread_delayed_free: AtomicUsize,
     pub thread_id: Cell<usize>,
     pub cookie: Cell<usize>,
     pub keys: [Cell<usize>; 2],
@@ -100,7 +101,7 @@ impl Heap {
     pub fn new_empty() -> Heap {
         Heap {
             tld: Cell::new(ptr::null_mut()),
-            thread_delayed_free: AtomicPtr::new(ptr::null_mut()),
+            thread_delayed_free: AtomicUsize::new(0),
             thread_id: Cell::new(0),
             cookie: Cell::new(0),
             keys: [Cell::new(0), Cell::new(0)],

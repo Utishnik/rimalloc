@@ -56,7 +56,7 @@ const fn heap_empty_const(empty_page: *mut crate::page::Page) -> Heap {
     }
     Heap {
         tld: Cell::new(ptr::null_mut()),
-        thread_delayed_free: core::sync::atomic::AtomicPtr::new(ptr::null_mut()),
+        thread_delayed_free: core::sync::atomic::AtomicUsize::new(0),
         thread_id: Cell::new(0),
         cookie: Cell::new(0),
         keys: [Cell::new(0), Cell::new(0)],

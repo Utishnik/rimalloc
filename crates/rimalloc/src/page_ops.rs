@@ -6,7 +6,7 @@ use core::sync::atomic::Ordering;
 
 use crate::constants::*;
 use crate::heap::{Heap, PageQueue};
-use crate::page::{Block, Delayed, Page, ThreadFree};
+use crate::page::{Block, Delayed, Page};
 
 const MAX_RETIRE_CYCLES: u8 = 16;
 const MAX_EXTEND_SIZE: usize = 4 * 1024;
@@ -26,36 +26,12 @@ fn page_block_at(page_start: *mut u8, block_size: usize, i: usize) -> *mut Block
 
 /// `_mi_page_try_use_delayed_free`
 pub fn page_try_use_delayed_free(page: &Page, delay: Delayed, override_never: bool) -> bool {
-    let mut yield_count = 0;
-    let mut tfree = page.xthread_free.load(Ordering::Acquire);
-    loop {
-        let old_delay = Delayed::from_bits(tfree);
-        if old_delay == Delayed::Freeing {
-            if yield_count >= 4 {
-                return false;
-            }
-            yield_count += 1;
-            std::thread::yield_now();
-            tfree = page.xthread_free.load(Ordering::Acquire);
-            continue;
-        }
-        if delay == old_delay {
-            return true;
-        }
-        if !override_never && old_delay == Delayed::NeverDelayedFree {
-            return true;
-        }
-        let tfreex = (tfree & !3) | delay as usize;
-        match page.xthread_free.compare_exchange_weak(
-            tfree,
-            tfreex,
-            Ordering::Release,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return true,
-            Err(v) => tfree = v,
-        }
-    }
+    crate::protocol::try_use_delayed(
+        &page.xthread_free,
+        delay as usize,
+        override_never,
+        std::thread::yield_now,
+    )
 }
 
 /// `_mi_page_use_delayed_free`
@@ -72,32 +48,18 @@ pub fn page_use_delayed_free(page: &Page, delay: Delayed, override_never: bool) 
 /// `_mi_page_thread_free_collect`: atomically take the cross-thread free
 /// list and append it to `local_free`.
 fn page_thread_free_collect(page: &Page) {
-    let mut tfree = page.xthread_free.load(Ordering::Relaxed);
-    let head = loop {
-        let head = ThreadFree(tfree).block();
-        let tfreex = tfree & 3; // keep the delayed bits, clear the list
-        match page.xthread_free.compare_exchange_weak(
-            tfree,
-            tfreex,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break head,
-            Err(v) => tfree = v,
-        }
-    };
-    let Some(head_ref) = (
-        // SAFETY: blocks on the thread-free list are free blocks in this page.
-        unsafe { head.as_ref() }
-    ) else {
+    let head_addr = crate::protocol::collect_take(&page.xthread_free);
+    let head: *mut Block = ptr::with_exposed_provenance_mut(head_addr);
+    if head.is_null() {
         return;
-    };
+    }
 
     // Find the tail and count (bounded by capacity to catch corruption).
     let max_count = page.capacity.get() as usize;
     let mut count = 1;
     let mut tail = head;
-    // SAFETY: list nodes are free blocks in this page.
+    // SAFETY: list nodes are free blocks in this page (ownership of the
+    // whole list was transferred by collect_take's AcqRel swap).
     while let Some(next) = unsafe { page.block_next(tail).as_mut() } {
         if count > max_count {
             break;
@@ -109,7 +71,6 @@ fn page_thread_free_collect(page: &Page) {
         crate::error("corrupted thread-free list");
         return;
     }
-    let _ = head_ref;
     // SAFETY: tail is a live node of this page.
     unsafe { page.block_set_next(tail, page.local_free.get()) };
     page.local_free.set(head);
@@ -223,46 +184,31 @@ fn page_fresh<'a>(heap: &'a Heap, pq: &PageQueue) -> Option<&'a Page> {
 /// `_mi_heap_delayed_free_partial`: free blocks other threads pushed on our
 /// heap's delayed list. Returns false if some were contended.
 pub fn heap_delayed_free_partial(heap: &Heap) -> bool {
-    let mut block = heap.thread_delayed_free.load(Ordering::Relaxed);
-    while !block.is_null() {
-        match heap.thread_delayed_free.compare_exchange_weak(
-            block,
-            ptr::null_mut(),
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(v) => block = v,
-        }
-    }
-    let mut all_freed = true;
-    // SAFETY: delayed-free blocks are free blocks owned by this heap's pages.
-    while let Some(b) = unsafe { block.as_ref() } {
-        let next = crate::page::ptr_decode(ptr::from_ref(heap).addr(), b.next.get(), &heap.keys);
-        if !crate::free::free_delayed_block(block) {
-            // another thread still holds DELAYED_FREEING: requeue
-            all_freed = false;
-            let mut dfree = heap.thread_delayed_free.load(Ordering::Relaxed);
-            loop {
-                b.next.set(crate::page::ptr_encode(
-                    ptr::from_ref(heap).addr(),
-                    dfree,
-                    &heap.keys,
-                ));
-                match heap.thread_delayed_free.compare_exchange_weak(
-                    dfree,
-                    block,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(v) => dfree = v,
-                }
+    // Links of delayed blocks are encoded with their *page's* keys (set by
+    // `mt_push` via `block_set_next`); the page is recovered from the
+    // block address.
+    let link_page = |addr: usize| -> &Page {
+        // SAFETY: delayed blocks live in pages of segments owned by us.
+        unsafe { crate::segment::ptr_page(ptr::with_exposed_provenance(addr)) }
+    };
+    crate::protocol::delayed_partial(
+        &heap.thread_delayed_free,
+        |addr| {
+            // SAFETY: we own the taken list.
+            unsafe { link_page(addr).block_next(ptr::with_exposed_provenance_mut(addr)) }
+                .expose_provenance()
+        },
+        |addr, next| {
+            // SAFETY: re-queueing a block we own; write-only.
+            unsafe {
+                link_page(addr).block_set_next(
+                    ptr::with_exposed_provenance_mut(addr),
+                    ptr::with_exposed_provenance_mut(next),
+                )
             }
-        }
-        block = next;
-    }
-    all_freed
+        },
+        |addr| crate::free::free_delayed_block(ptr::with_exposed_provenance_mut(addr)),
+    )
 }
 
 /// `_mi_heap_delayed_free_all`

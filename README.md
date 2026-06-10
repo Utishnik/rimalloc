@@ -118,6 +118,24 @@ Stable Rust is supported (the `nightly` feature opts into raw
 - Secure mode (free-list encoding, guard pages), debug fill patterns.
 - Extend the Lean verification beyond the current proofs.
 
+## Concurrency model checking (loom)
+
+The cross-thread delayed-free protocol — the one subsystem Lean cannot
+reach — lives as a *single generic implementation* in `src/protocol.rs`:
+production `free.rs`/`page_ops.rs` call it with `core` atomics on live
+pages/heaps, and `tests/loom_protocol.rs` calls the *same functions* with
+loom atomics, exploring every interleaving of the real CAS structure,
+memory orderings, and FREEING-flag transitions. Checked: no freed block is
+ever lost or duplicated between the page list and the heap delayed list,
+`used` reaches exactly zero, and FREEING never leaks. Editing the protocol
+automatically re-subjects it to the model check — there is no mirror to
+drift.
+
+```
+LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS="--cfg loom" \
+  cargo test -p rimalloc --test loom_protocol --release
+```
+
 ## Formal verification (Lean 4)
 
 `verify/` contains a Lean 4 (lake) project with machine-checked proofs over

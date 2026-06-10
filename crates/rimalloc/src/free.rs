@@ -4,7 +4,7 @@
 use core::ptr;
 use core::sync::atomic::Ordering;
 
-use crate::page::{Block, Delayed, Page, ThreadFree};
+use crate::page::{Block, Delayed, Page};
 use crate::page_ops;
 use crate::segment::{Segment, SegmentKind, ptr_segment};
 
@@ -105,69 +105,29 @@ fn free_generic_local(page: &Page, p: *mut u8) {
 /// thread-free list, or the owning heap's delayed list if this is the first
 /// concurrent free into a full page.
 fn free_block_delayed_mt(page: &Page, block: *mut Block) {
-    let mut tfree = page.xthread_free.load(Ordering::Relaxed);
-    let use_delayed = loop {
-        let use_delayed = ThreadFree(tfree).delayed() == Delayed::UseDelayedFree;
-        let tfreex = if use_delayed {
-            (tfree & !3) | Delayed::Freeing as usize
-        } else {
-            // SAFETY: we own the dying block; write-only (contents may be
-            // uninitialized user memory).
-            unsafe { page.block_set_next(block, ThreadFree(tfree).block()) };
-            block.expose_provenance() | (tfree & 3)
-        };
-        match page.xthread_free.compare_exchange_weak(
-            tfree,
-            tfreex,
-            Ordering::Release,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => break use_delayed,
-            Err(v) => tfree = v,
-        }
-    };
-
-    if use_delayed {
-        // First concurrent free into a full page: push on the heap's delayed
-        // list. The racy heap read is safe because DELAYED_FREEING is set.
-        let heap = page.xheap.load(Ordering::Acquire);
-        if let Some(heap) =
-            // SAFETY: heap stays valid while any page holds DELAYED_FREEING.
-            unsafe { ptr::with_exposed_provenance::<crate::heap::Heap>(heap).as_ref() }
-        {
-            let mut dfree = heap.thread_delayed_free.load(Ordering::Relaxed);
-            loop {
-                let enc = crate::page::ptr_encode(ptr::from_ref(heap).addr(), dfree, &heap.keys);
-                // SAFETY: we own the dying block; write-only. The heap
-                // delayed list is encoded with the heap's keys (like C).
-                unsafe { Block::write_next(block, enc) };
-                match heap.thread_delayed_free.compare_exchange_weak(
-                    dfree,
-                    block,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(v) => dfree = v,
-                }
+    crate::protocol::mt_push(
+        &page.xthread_free,
+        || {
+            // The racy heap read is safe because FREEING is held.
+            let heap = page.xheap.load(Ordering::Acquire);
+            // SAFETY: heap stays valid while any page holds FREEING.
+            unsafe {
+                ptr::with_exposed_provenance::<crate::heap::Heap>(heap)
+                    .as_ref()
+                    .map(|h| &h.thread_delayed_free)
             }
-        }
-        // reset DELAYED_FREEING to NO_DELAYED_FREE
-        let mut tfree = page.xthread_free.load(Ordering::Relaxed);
-        loop {
-            debug_assert!(ThreadFree(tfree).delayed() == Delayed::Freeing);
-            let tfreex = (tfree & !3) | Delayed::NoDelayedFree as usize;
-            match page.xthread_free.compare_exchange_weak(
-                tfree,
-                tfreex,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(v) => tfree = v,
+        },
+        block.expose_provenance(),
+        |next| {
+            // SAFETY: we own the dying block; write-only (its contents may
+            // be uninitialized user memory). Page-keyed encoding for the
+            // page list; the heap-keyed delayed encoding is applied by the
+            // owner's decode in heap_delayed_free_partial symmetrically.
+            unsafe {
+                page.block_set_next(block, ptr::with_exposed_provenance_mut(next));
             }
-        }
-    }
+        },
+    );
 }
 
 /// `mi_free_block_mt`
