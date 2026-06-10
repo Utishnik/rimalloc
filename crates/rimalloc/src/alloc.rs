@@ -33,6 +33,10 @@ pub fn page_malloc_zero(heap: &Heap, page: &Page, size: usize, zero: bool) -> Op
             // SAFETY: the block is block_size bytes, exclusively ours now.
             unsafe { ptr::write_bytes(block.cast::<u8>(), 0, page.block_size()) };
         }
+    } else if cfg!(feature = "debug-fill") && !page.is_huge.get() {
+        // MI_DEBUG_UNINIT: stamp fresh blocks to surface uninitialized reads.
+        // SAFETY: the block is exclusively ours.
+        unsafe { ptr::write_bytes(block.cast::<u8>(), 0xD0, page.usable_block_size()) };
     }
     NonNull::new(block.cast())
 }

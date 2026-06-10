@@ -60,6 +60,13 @@ fn free_block_local(page: &Page, block: *mut Block, check_full: bool) {
     if check_is_double_free(page, block) {
         return;
     }
+    if cfg!(feature = "debug-fill") && !page.is_huge.get() {
+        // MI_DEBUG_FREED: stamp freed blocks to surface use-after-free.
+        // SAFETY: the block is dead; the next-pointer word is rewritten below.
+        unsafe {
+            core::ptr::write_bytes(block.cast::<u8>(), 0xDF, page.block_size());
+        }
+    }
     // SAFETY: the caller owns this (possibly partially-initialized) block;
     // write-only, as the old contents may be uninitialized.
     unsafe { page.block_set_next(block, page.local_free.get()) };

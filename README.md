@@ -100,9 +100,11 @@ bundling C mimalloc **v3.3.2** and the macOS system allocator —
       hooks (heartbeat-driven, recursion-guarded, provenance-correct)
 - [x] `is_in_heap_region`
 
+- [x] Debug fill patterns (`debug-fill` feature, `MI_DEBUG` 0xD0/0xDF
+      uninit/freed stamping) with the corresponding `test-api-fill.c` tests
+
 ### Parity gaps / roadmap
 
-- Debug fill patterns (`MI_DEBUG` uninit/freed byte stamping).
 - Per-page guard pages (`MI_SECURE=5`'s most expensive level).
 - Page-granular purging inside live segments is ported; tuning it to match
   C's burst peak-RSS exactly remains.

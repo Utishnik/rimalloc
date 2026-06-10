@@ -16,6 +16,9 @@ stats = []
 # Security mitigations (MI_SECURE 3/4): encoded free lists with per-page
 # random keys, corrupted-list and double-free detection.
 secure = []
+# Debug fill patterns (MI_DEBUG): stamp 0xD0 over fresh blocks and 0xDF
+# over freed blocks to surface use-of-uninitialized and use-after-free.
+debug-fill = []
 
 [lints]
 workspace = true
