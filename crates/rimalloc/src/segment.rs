@@ -1100,8 +1100,72 @@ impl Segment {
         slice
     }
 
+    /// Debug validator (port of `mi_segment_is_valid`), asserting the
+    /// Lean-proven span invariants (`Spans.lean`) on a live segment:
+    /// span heads partition the slice array exactly (`norm_total`), all
+    /// spans are non-empty (`norm_wf`), no two adjacent free spans exist
+    /// (`norm_coalesced`), and back-offsets let interior pointers and
+    /// coalescing find span heads.
+    #[cfg(debug_assertions)]
+    pub fn assert_valid(&self) {
+        if self.kind.get() != SegmentKind::Normal {
+            return; // huge layouts intentionally exceed `slice_entries`
+        }
+        let entries = self.slice_entries.get();
+        let mut idx = 0;
+        let mut total = 0;
+        let mut prev_free = false;
+        while idx < entries {
+            let head = &self.slices[idx];
+            let count = head.slice_count.get() as usize;
+            debug_assert!(count > 0, "empty span at {idx}");
+            debug_assert!(
+                head.slice_offset.get() == 0,
+                "span head with offset at {idx}"
+            );
+            let is_free = head.block_size.get() == 0;
+            debug_assert!(
+                !(prev_free && is_free),
+                "adjacent free spans at {idx} (coalescing incomplete)"
+            );
+            prev_free = is_free;
+            // back-offsets: interior entries point at the head
+            let last = (idx + count - 1).min(entries - 1);
+            if is_free {
+                if last > idx {
+                    let l = &self.slices[last];
+                    debug_assert!(
+                        l.slice_offset.get() as usize == size_of::<Slice>() * (last - idx),
+                        "free-span tail back-offset wrong at {last}"
+                    );
+                }
+            } else {
+                let extra = (count - 1)
+                    .min(MAX_SLICE_OFFSET_COUNT)
+                    .min(entries - idx - 1);
+                for i in 1..=extra {
+                    let e = &self.slices[idx + i];
+                    debug_assert!(
+                        e.slice_offset.get() as usize == size_of::<Slice>() * i
+                            && e.slice_count.get() == 0,
+                        "used-span back-offset wrong at {}",
+                        idx + i
+                    );
+                }
+            }
+            total += count;
+            idx += count;
+        }
+        debug_assert!(
+            total == entries,
+            "span partition broken: covers {total} of {entries} slices"
+        );
+    }
+
     /// `_mi_segment_page_free`
     pub fn page_free(&self, page: &Page, _force: bool, tld: &SegmentsTld) {
+        #[cfg(debug_assertions)]
+        self.assert_valid();
         self.page_clear(page, tld);
         if self.used.get() == 0 {
             segment_free(self, tld);

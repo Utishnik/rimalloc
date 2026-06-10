@@ -125,11 +125,23 @@ faithful models of the allocator's core arithmetic:
 - **`CommitMask.lean`** — the commit-mask `create` loop equals the
   closed-form `((1 << count) - 1) << idx` for all 512-bit (idx, count)
   pairs, plus a `testBit` characterization.
+- **`Spans.lean`** — segment span coalescing: normalization preserves the
+  slice partition, keeps spans non-empty, and yields *maximal* spans (no
+  adjacent free spans) — the soundness basis for O(1) neighbor-merging;
+  splitting and state flips preserve the partition.
 - **`FreeList.lean`** — the page free-list counting invariant
   (`used + |free| + |local_free| = capacity ≤ reserved`,
   `|thread_free| ≤ used`) is preserved by alloc, local free, remote free,
   thread-collect, collect, and extend — so `used == 0` soundly means
   "no live blocks" in `page_retire`/`page_free`.
+
+The proofs are **bridged to the live implementation**:
+`lake exe genvectors` evaluates the proven model over its full domain into
+committed vectors, and `tests/lean_conformance.rs` pins the Rust functions
+to them exactly — refactor freely; `cargo test` re-verifies that every
+theorem still transfers. The infinite-state invariants (free-list counts,
+span partition/maximality/back-offsets) are asserted on the *live*
+allocator by debug-build validators at every page collect and page free.
 
 ```
 cd verify && lake build   # all proofs check, no sorries
