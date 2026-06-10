@@ -19,7 +19,9 @@ echo "== stress (ported test-stress.c) =="
 cargo run --release --example stress -- 16 25 10
 
 echo "== Miri (aliasing-model verification) =="
-cargo miri test -p rimalloc
+# --tests --lib: the lone doctest is pathological under Miri's borrow
+# tracking (>50 min for 3 calls all covered by the api tests)
+cargo miri test -p rimalloc --tests --lib
 
 echo "== loom model check (delayed-free protocol) =="
 LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS="--cfg loom" cargo test -p rimalloc --test loom_protocol --release
