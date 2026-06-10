@@ -1,7 +1,8 @@
 //! fork() safety: the child of a multithreaded allocating process must be
 //! able to keep allocating (locks are held across fork and released in the
 //! child; another thread's mid-critical-section state cannot leak in).
-#![cfg(unix)]
+//! Miri cannot emulate `fork`, so this target is skipped under Miri.
+#![cfg(all(unix, not(miri)))]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

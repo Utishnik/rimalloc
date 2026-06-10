@@ -38,6 +38,7 @@ options! {
     FullPageRetain => full_page_retain: 2, "MIMALLOC_FULL_PAGE_RETAIN";
     MaxPageCandidates => max_page_candidates: 4, "MIMALLOC_MAX_PAGE_CANDIDATES";
     MaxSegmentReclaim => max_segment_reclaim: 10, "MIMALLOC_MAX_SEGMENT_RECLAIM";
+    AbandonedReclaimOnFree => abandoned_reclaim_on_free: 0, "MIMALLOC_ABANDONED_RECLAIM_ON_FREE";
     TargetSegmentsPerThread => target_segments_per_thread: 0, "MIMALLOC_TARGET_SEGMENTS_PER_THREAD";
     ArenaReserve => arena_reserve: 1024 * 1024, "MIMALLOC_ARENA_RESERVE"; // KiB
     ShowErrors => show_errors: 0, "MIMALLOC_SHOW_ERRORS";
@@ -88,7 +89,21 @@ pub fn disable(option: Option) {
     set(option, 0)
 }
 
+/// `_mi_clock_now`: monotonic milliseconds. Only used for relative purge
+/// deadlines (>= 10ms granularity), so on Apple the cheap commpage-cached
+/// approximate clock is used; `CLOCK_MONOTONIC` there is a gettimeofday +
+/// boottime computation that shows up in thread-churn profiles.
+#[cfg(all(target_vendor = "apple", not(miri)))]
+pub fn clock_now() -> i64 {
+    unsafe extern "C" {
+        fn clock_gettime_nsec_np(clock_id: libc::clockid_t) -> u64;
+    }
+    // SAFETY: no preconditions.
+    (unsafe { clock_gettime_nsec_np(libc::CLOCK_MONOTONIC_RAW_APPROX) } / 1_000_000) as i64
+}
+
 /// `_mi_clock_now`: monotonic milliseconds.
+#[cfg(not(all(target_vendor = "apple", not(miri))))]
 #[allow(clippy::unnecessary_cast)] // tv_sec/tv_nsec are narrower off-macOS
 pub fn clock_now() -> i64 {
     let mut ts = libc::timespec {

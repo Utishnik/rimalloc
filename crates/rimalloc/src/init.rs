@@ -108,11 +108,58 @@ fn empty_heap() -> *mut Heap {
     ptr::from_ref(&EMPTY_HEAP.0).cast_mut()
 }
 
+/// Direct pthread TSD slot for the default heap on Apple arm64: the same
+/// unused slot C mimalloc claims (`MI_TLS_SLOT` 89, `__PTK_FRAMEWORK_OLDGC_KEY9`).
+/// Mach-O `thread_local!`/`#[thread_local]` accesses go through a
+/// `_tlv_get_addr` call on every malloc/free; this is a 3-instruction load
+/// off the read-only thread register instead, and (unlike TLV storage) it
+/// stays valid through TLS teardown at thread exit.
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64", not(miri)))]
+mod tsd {
+    use super::*;
+
+    const HEAP_SLOT: usize = 89;
+
+    #[inline(always)]
+    fn tsd_base() -> *mut usize {
+        let tcb: *mut usize;
+        // SAFETY: reads the read-only thread register; no memory effects.
+        unsafe {
+            core::arch::asm!(
+                "mrs {tcb}, tpidrro_el0",
+                "bic {tcb}, {tcb}, #7",
+                tcb = out(reg) tcb,
+                options(nomem, nostack, pure, preserves_flags)
+            );
+        }
+        tcb
+    }
+
+    pub struct HeapSlot;
+    impl HeapSlot {
+        #[inline(always)]
+        pub fn get(&self) -> *mut Heap {
+            // SAFETY: slot 89 of this thread's TSD block is reserved for the
+            // allocator (as in C mimalloc on Apple); it is zero on fresh
+            // threads, which maps to the static empty heap.
+            let p = unsafe { (*tsd_base().add(HEAP_SLOT)) as *mut Heap };
+            if p.is_null() { empty_heap() } else { p }
+        }
+        #[inline(always)]
+        pub fn set(&self, v: *mut Heap) {
+            // SAFETY: as in `get`; only this thread writes its own slot.
+            unsafe { *tsd_base().add(HEAP_SLOT) = v as usize }
+        }
+    }
+    pub static DEFAULT_HEAP: HeapSlot = HeapSlot;
+}
+
 /// The allocator's three thread-local slots. Stable Rust uses
 /// const-initialized `thread_local!` (correct everywhere, ~1ns per access
 /// through `LocalKey`); the opt-in `nightly` feature uses raw
 /// `#[thread_local]` statics for direct TLS loads on the malloc/free fast
-/// paths.
+/// paths. On Apple arm64 the default-heap slot instead lives in a pthread
+/// TSD slot (see `tsd` above).
 #[cfg(not(feature = "nightly"))]
 mod tls {
     use super::*;
@@ -131,16 +178,22 @@ mod tls {
 
     thread_local! {
         static TID_KEY: Cell<usize> = const { Cell::new(0) };
+        static RNG_KEY: Cell<u64> = const { Cell::new(0) };
+    }
+    #[cfg(not(all(target_vendor = "apple", target_arch = "aarch64", not(miri))))]
+    thread_local! {
         static HEAP_KEY: Cell<*mut Heap> =
             const { Cell::new((&raw const EMPTY_HEAP.0).cast_mut()) };
-        static RNG_KEY: Cell<u64> = const { Cell::new(0) };
     }
     #[cfg_attr(
         all(target_vendor = "apple", target_arch = "aarch64", not(miri)),
         allow(dead_code)
     )]
     pub static TID: Slot<usize> = Slot(&TID_KEY);
+    #[cfg(not(all(target_vendor = "apple", target_arch = "aarch64", not(miri))))]
     pub static DEFAULT_HEAP: Slot<*mut Heap> = Slot(&HEAP_KEY);
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64", not(miri)))]
+    pub use super::tsd::DEFAULT_HEAP;
     pub static RNG: Slot<u64> = Slot(&RNG_KEY);
 }
 
@@ -150,6 +203,7 @@ mod tls {
 
     #[thread_local]
     static TID_RAW: Cell<usize> = Cell::new(0);
+    #[cfg(not(all(target_vendor = "apple", target_arch = "aarch64", not(miri))))]
     #[thread_local]
     static HEAP_RAW: Cell<*mut Heap> = Cell::new((&raw const EMPTY_HEAP.0).cast_mut());
     #[thread_local]
@@ -184,7 +238,10 @@ mod tls {
         allow(unused_imports)
     )]
     pub use tid::TID;
+    #[cfg(not(all(target_vendor = "apple", target_arch = "aarch64", not(miri))))]
     slot!(HeapSlot, *mut Heap, HEAP_RAW, DEFAULT_HEAP);
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64", not(miri)))]
+    pub use super::tsd::DEFAULT_HEAP;
     slot!(RngSlot, u64, RNG_RAW, RNG);
 }
 

@@ -4,7 +4,7 @@
 //!
 //! Usage: stress [THREADS] [SCALE] [ITER]
 
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 const TRANSFERS: usize = 1000;
 const COOKIE: usize = 0xbf58476d1ce4e5b9;
@@ -120,12 +120,39 @@ fn stress(tid: usize, scale: usize) {
     }
 }
 
+static SCALE: AtomicUsize = AtomicUsize::new(0);
+
+/// Matches the C harness's pthread `thread_entry` trampoline.
+extern "C" fn thread_entry(param: *mut libc::c_void) -> *mut libc::c_void {
+    stress(param as usize, SCALE.load(Ordering::Relaxed));
+    std::ptr::null_mut()
+}
+
+/// Spawn via raw `pthread_create`/`pthread_join` with default attributes,
+/// exactly like the C `run_os_threads` (std::thread adds guard-page mmaps,
+/// sigaltstack setup, and panic plumbing per spawn that the C harness
+/// doesn't pay for).
 fn run_os_threads(nthreads: usize, scale: usize) {
-    let handles: Vec<_> = (0..nthreads)
-        .map(|tid| std::thread::spawn(move || stress(tid, scale)))
-        .collect();
-    for h in handles {
-        h.join().unwrap();
+    SCALE.store(scale, Ordering::Relaxed);
+    let mut threads: Vec<libc::pthread_t> = Vec::with_capacity(nthreads);
+    for tid in 0..nthreads {
+        let mut t: libc::pthread_t = unsafe { std::mem::zeroed() };
+        // SAFETY: thread_entry is a valid extern "C" fn; tid is passed by value.
+        let rc = unsafe {
+            libc::pthread_create(
+                &mut t,
+                std::ptr::null(),
+                thread_entry,
+                tid as *mut libc::c_void,
+            )
+        };
+        assert_eq!(rc, 0, "pthread_create failed");
+        threads.push(t);
+    }
+    for t in threads {
+        // SAFETY: t is a joinable thread created above.
+        let rc = unsafe { libc::pthread_join(t, std::ptr::null_mut()) };
+        assert_eq!(rc, 0, "pthread_join failed");
     }
 }
 

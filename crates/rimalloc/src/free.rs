@@ -163,8 +163,12 @@ fn free_block_mt_reclaim(segment: &Segment, p: *mut u8) -> bool {
 
 /// `mi_free_block_mt`
 fn free_block_mt(page: &Page, segment: &Segment, block: *mut Block, p: *mut u8) {
-    // Try to reclaim an abandoned segment into our heap first.
-    if segment.is_abandoned() && free_block_mt_reclaim(segment, p) {
+    // Try to reclaim an abandoned segment into our heap first (off by
+    // default, as in C mimalloc's `abandoned_reclaim_on_free`).
+    if segment.is_abandoned()
+        && crate::options::abandoned_reclaim_on_free() != 0
+        && free_block_mt_reclaim(segment, p)
+    {
         return;
     }
     if segment.kind.get() == SegmentKind::Huge {

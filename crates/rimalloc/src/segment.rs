@@ -191,6 +191,7 @@ pub struct Segment {
 
     pub abandoned_os_next: Cell<*mut Segment>,
     pub abandoned_os_prev: Cell<*mut Segment>,
+    pub abandoned_os_listed: Cell<bool>,
 
     pub segment_slices: Cell<usize>,
     pub segment_info_slices: Cell<usize>,
@@ -1276,18 +1277,24 @@ pub mod abandoned {
     /// `_mi_arena_segment_mark_abandoned` (OS-list flavor): push at the end.
     pub fn mark(segment: &Segment) {
         locked(|| {
-            segment.abandoned_os_next.set(ptr::null_mut());
-            segment.abandoned_os_prev.set(LIST.last.get());
-            // SAFETY: list nodes are live abandoned segments.
-            match unsafe { LIST.last.get().as_ref() } {
-                Some(last) => last
-                    .abandoned_os_next
-                    .set(ptr::from_ref(segment).cast_mut()),
-                None => LIST.first.set(ptr::from_ref(segment).cast_mut()),
-            }
-            LIST.last.set(ptr::from_ref(segment).cast_mut());
+            link_last(segment);
         });
         COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Append `segment` at the tail. Lock must be held.
+    fn link_last(segment: &Segment) {
+        segment.abandoned_os_next.set(ptr::null_mut());
+        segment.abandoned_os_prev.set(LIST.last.get());
+        segment.abandoned_os_listed.set(true);
+        // SAFETY: list nodes are live abandoned segments.
+        match unsafe { LIST.last.get().as_ref() } {
+            Some(last) => last
+                .abandoned_os_next
+                .set(ptr::from_ref(segment).cast_mut()),
+            None => LIST.first.set(ptr::from_ref(segment).cast_mut()),
+        }
+        LIST.last.set(ptr::from_ref(segment).cast_mut());
     }
 
     fn unlink(segment: &Segment) {
@@ -1304,6 +1311,7 @@ pub mod abandoned {
         }
         segment.abandoned_os_next.set(ptr::null_mut());
         segment.abandoned_os_prev.set(ptr::null_mut());
+        segment.abandoned_os_listed.set(false);
         COUNT.fetch_sub(1, Ordering::Relaxed);
     }
 
@@ -1311,10 +1319,7 @@ pub mod abandoned {
     /// segment. Returns false if some other thread claimed it first.
     pub fn clear(segment: &Segment) -> bool {
         locked(|| {
-            // Still on the list? (prev/next null AND not first => taken)
-            let on_list = !segment.abandoned_os_prev.get().is_null()
-                || !segment.abandoned_os_next.get().is_null()
-                || LIST.first.get() == ptr::from_ref(segment).cast_mut();
+            let on_list = segment.abandoned_os_listed.get();
             if on_list {
                 unlink(segment);
             }
@@ -1333,6 +1338,67 @@ pub mod abandoned {
             unlink(segment);
             Some(segment)
         })
+    }
+
+    /// Detach up to `n` segments from the head in a single lock acquisition.
+    /// Returns a chain linked through `abandoned_os_next`; every node is off
+    /// the list (`clear` on it returns false) and exclusively ours.
+    pub fn take<'a>(n: usize) -> Option<&'a Segment> {
+        if n == 0 || COUNT.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let (head, taken) = locked(|| {
+            let head = LIST.first.get();
+            // SAFETY: list nodes are live abandoned segments (lock held).
+            let Some(mut tail) = (unsafe { head.as_ref() }) else {
+                return (head, 0);
+            };
+            let mut taken = 1usize;
+            tail.abandoned_os_prev.set(ptr::null_mut());
+            tail.abandoned_os_listed.set(false);
+            while taken < n
+                // SAFETY: list nodes are live abandoned segments (lock held).
+                && let Some(next) = unsafe { tail.abandoned_os_next.get().as_ref() }
+            {
+                tail = next;
+                tail.abandoned_os_prev.set(ptr::null_mut());
+                tail.abandoned_os_listed.set(false);
+                taken += 1;
+            }
+            let rest = tail.abandoned_os_next.get();
+            tail.abandoned_os_next.set(ptr::null_mut());
+            LIST.first.set(rest);
+            // SAFETY: as above.
+            match unsafe { rest.as_ref() } {
+                Some(r) => r.abandoned_os_prev.set(ptr::null_mut()),
+                None => LIST.last.set(ptr::null_mut()),
+            }
+            (head, taken)
+        });
+        if taken > 0 {
+            COUNT.fetch_sub(taken, Ordering::Relaxed);
+        }
+        // SAFETY: chain head is a live abandoned segment owned by us.
+        unsafe { head.as_ref() }
+    }
+
+    /// Re-abandon a chain of `count` segments (linked via `abandoned_os_next`,
+    /// as built by the caller) in a single lock acquisition.
+    pub fn splice(head: *mut Segment, count: usize) {
+        if head.is_null() {
+            return;
+        }
+        locked(|| {
+            let mut p = head;
+            // SAFETY: chain nodes are live abandoned segments owned by the
+            // caller until spliced (lock held).
+            while let Some(segment) = unsafe { p.as_ref() } {
+                let next = segment.abandoned_os_next.get();
+                link_last(segment);
+                p = next;
+            }
+        });
+        COUNT.fetch_add(count, Ordering::Relaxed);
     }
 }
 
@@ -1527,24 +1593,39 @@ fn try_reclaim<'a>(
 pub fn abandoned_collect(heap: &Heap, force: bool, tld: &SegmentsTld) {
     // One pass over the segments abandoned at entry (the C version's arena
     // cursor visits each at most once); re-pushed segments are not revisited.
-    let mut max_tries = if force {
+    // The whole batch is detached in one lock acquisition and survivors are
+    // re-abandoned in one more, instead of locking twice per segment.
+    let max_tries = if force {
         abandoned::count()
     } else {
         abandoned::count().min(1024)
     };
-    while max_tries > 0 {
-        max_tries -= 1;
-        let Some(segment) = abandoned::pop() else {
-            break;
-        };
+    let mut p = abandoned::take(max_tries);
+    let mut keep_head: *mut Segment = ptr::null_mut();
+    let mut keep_tail: *mut Segment = ptr::null_mut();
+    let mut keep_count = 0usize;
+    while let Some(segment) = p {
+        // SAFETY: the chain was detached by `take`; read the link before the
+        // segment is potentially freed below.
+        p = unsafe { segment.abandoned_os_next.get().as_ref() };
+        segment.abandoned_os_next.set(ptr::null_mut());
         segment_check_free(segment, 0, 0, tld);
         if segment.used.get() == 0 {
             segment_reclaim(segment, heap, 0, None, tld);
         } else {
             segment.try_purge(force);
-            abandoned::mark(segment);
+            let sp = ptr::from_ref(segment).cast_mut();
+            if keep_tail.is_null() {
+                keep_head = sp;
+            } else {
+                // SAFETY: keep_tail is a live segment owned by this chain.
+                unsafe { (*keep_tail).abandoned_os_next.set(sp) };
+            }
+            keep_tail = sp;
+            keep_count += 1;
         }
     }
+    abandoned::splice(keep_head, keep_count);
 }
 
 // ---------------------------------------------------------------------------
