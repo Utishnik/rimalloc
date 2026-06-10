@@ -77,15 +77,19 @@ Key invariants (from `types.h`):
 - [x] Ported test suite: `test-api.c`, `test-api-fill.c`, `test-stress.c`
 - [x] Miri-clean on the ported suite
 - [x] Stress (`test-stress.c` port, instruction-parity harness on both
-      sides): rimalloc retires *fewer* instructions than C mimalloc v2.3.2
-      (64.2G vs 65.8G per 100 iters) but trails ~18% on user time
-      (13.1s vs 11.2s quiet). Ablation isolates the entire gap to the
-      cross-thread transfer traffic: with the bench's 25% transfer
-      exchange disabled rimalloc is *ahead* (11.05s vs 11.17s); the same
-      ablation moves C by only 0.05s. The residual is stall time on the
-      ~27M cross-thread block hand-offs (mt-CAS push, owner adoption of
-      remote-dirty chains, full-queue delayed-free pings), not
-      instruction count.
+      sides): rimalloc is ~5% *ahead* of C mimalloc v2.3.2 on user time
+      (interleaved mins of 3: 23.0s vs 24.3s at `32 50 200`, 5.70s vs
+      6.04s at `32 50 50`). Earlier reports of an ~18% deficit traced to
+      a stale `test-stress.o` in the C reference build left over from a
+      transfer-ablation experiment — the C binary was running with the
+      bench's 25% cross-thread exchange compiled out. With both sides
+      instrumented on identical pristine sources the hand-off machinery
+      is at op-count parity per run (mt pushes 19.0M vs 19.2M; full-page
+      delayed-free pings 1.56M vs 1.50M; `page_unfull`/`page_to_full`
+      churn 1.40M on both), and rimalloc pointer-chases *fewer*
+      remote-dirty lines during adoption (12.0M vs 17.7M blocks walked)
+      because the count rides in the thread-free word instead of being
+      recounted by walking the chain.
 
 Microbenchmarks (`crates/bench`, min of 3 interleaved runs, Apple M3 Max
 (16 cores, macOS 15, one background core busy during measurement), vs the
