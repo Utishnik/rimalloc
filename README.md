@@ -76,25 +76,38 @@ Key invariants (from `types.h`):
       (~5% overhead, mirroring `MI_SECURE=3/4`)
 - [x] Ported test suite: `test-api.c`, `test-api-fill.c`, `test-stress.c`
 - [x] Miri-clean on the ported suite
-- [x] Stress (32 threads × 50 iters): 0.66s vs C mimalloc v2.3.2's 0.62s
-      (within ~7%; syscalls at parity after segment/thread caching)
+- [x] Stress (`test-stress.c` port, 32 threads × 50 iters, pthread harness
+      on both sides): within ~4-5% of C mimalloc v2.3.2 on user time
+      (6.4s vs 6.1s quiet, 7.4s vs 7.1s loaded); ahead of C at higher per-thread scales
+      (1 thread × scale 5000: 7.2s vs C's 9.1s user). The residual gap is
+      thread-churn metadata cost from the deliberate 2-cache-line page
+      header split that buys the larson/xmalloc wins below.
 
-Microbenchmarks (`crates/bench`, Apple Silicon, vs the `mimalloc` crate
-bundling C mimalloc **v3.3.2** and the macOS system allocator —
-**rimalloc wins all four**):
+Microbenchmarks (`crates/bench`, min of 3 interleaved runs, Apple M3 Max
+(16 cores, macOS 15, one background core busy during measurement), vs the
+`mimalloc` crate bundling C mimalloc **v3.3.2** and the macOS system
+allocator — **rimalloc wins every allocator-sensitive bench**):
 
 | bench | rimalloc | mimalloc v3.3.2 | system |
 |---|---|---|---|
-| pairs (same-size alloc/free) | **0.108s** | 0.128s | 0.320s |
-| mixed (random sizes, 100k slots) | **0.336s** | 0.414s | 0.945s |
-| xthread (producer/consumer) | **0.178s** | 0.189s | 0.255s |
-| threads (thread churn) | **0.058s** | 0.067s | 0.120s |
-| json (serde_json parse+walk+serialize, 8 threads, compiled-in) | **0.310s** | 0.346s | 0.584s |
-| regex (control: allocator-insensitive) | 0.040s | 0.041s | 0.042s |
+| pairs (same-size alloc/free) | **0.136s** | 0.165s | 0.321s |
+| mixed (random sizes, 100k slots) | **0.348s** | 0.433s | 0.779s |
+| xthread (producer/consumer) | **0.191s** | 0.214s | 0.217s |
+| threads (thread churn) | **0.064s** | 0.077s | 0.122s |
+| json (serde_json parse+walk+serialize, 8 threads) | **0.285s** | 0.313s | 0.566s |
+| larson (server: random size mix, cross-thread frees) | **0.051s** | 0.085s | 0.406s |
+| xmalloc (producer/consumer free pressure) | **0.096s** | 0.153s | 0.202s |
+| xpipe (xmalloc over `sync_channel`) | **0.048s** | 0.056s | 0.160s |
+| xring (xmalloc over lock-free SPSC ring) | **0.122s** | 0.166s | 0.235s |
+| scratch (cache-scratch false sharing; insensitive) | 0.036s | 0.036s | 0.036s |
+| regex (control: allocator-insensitive) | 0.042s | 0.038s | 0.041s |
 
-Stable Rust is supported (the `nightly` feature opts into raw
-`#[thread_local]` TLS, ~3-5% faster); `fork()` is handled via
-`pthread_atfork` lock ordering and tested under multithreaded load.
+Stable Rust is supported with no fast-path penalty: on Apple arm64 the
+default heap lives in a dedicated pthread TSD slot (as C mimalloc's
+`MI_TLS_SLOT`), so malloc/free pay no `_tlv_get_addr` call; elsewhere the
+opt-in `nightly` feature switches `thread_local!` to raw `#[thread_local]`.
+`fork()` is handled via `pthread_atfork` lock ordering and tested under
+multithreaded load.
 
 - [x] `reserve_os_memory` / `manage_os_memory` (adopt external memory),
       exclusive arenas, `heap_new_in_arena` / `heap_new_ex` (heap tags),
@@ -115,7 +128,6 @@ Stable Rust is supported (the `nightly` feature opts into raw
 - Page-granular purging inside live segments is ported; tuning it to match
   C's burst peak-RSS exactly remains.
 - First-class heaps as a typed Rust API (`Heap` is already exposed).
-- Secure mode (free-list encoding, guard pages), debug fill patterns.
 - Extend the Lean verification beyond the current proofs.
 
 ## Fuzzing
