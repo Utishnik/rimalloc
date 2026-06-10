@@ -432,9 +432,14 @@ fn main() {
         "system"
     };
     println!("allocator: {name}");
+    let reps: usize = std::env::var("BENCH_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     let run = |bench: &str, f: fn() -> f64| {
         if which == "all" || which == bench {
-            println!("{bench:>10}: {:.3}s", f());
+            let t = (0..reps).map(|_| f()).fold(f64::INFINITY, f64::min);
+            println!("{bench:>10}: {t:.3}s");
         }
     };
     run("pairs", bench_pairs);

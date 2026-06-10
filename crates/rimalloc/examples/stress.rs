@@ -50,7 +50,9 @@ fn alloc_items(mut items: usize, r: &mut usize) -> *mut usize {
     if !p.is_null() {
         for i in 0..items {
             unsafe {
-                assert_eq!(*p.add(i), 0);
+                // C builds the reference harness with NDEBUG, compiling out
+                // its `assert(p[i] == 0)`; keep instruction parity here.
+                debug_assert_eq!(*p.add(i), 0);
                 *p.add(i) = (items - i) ^ COOKIE;
             }
         }
@@ -187,4 +189,7 @@ fn main() {
     println!("syscalls: mmap={mmap} munmap={munmap} madvise={madvise} mprotect={mprotect}");
     let (abandoned, tries, hits) = rimalloc::abandoned_stats();
     println!("abandoned={abandoned} reclaim_tries={tries} reclaim_hits={hits}");
+    if std::env::var_os("STRESS_STATS").is_some() {
+        rimalloc::stats_print();
+    }
 }

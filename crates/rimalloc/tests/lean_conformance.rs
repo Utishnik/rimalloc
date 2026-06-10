@@ -46,9 +46,12 @@ fn bin_sizes_match_lean_model() {
 fn commit_mask_matches_closed_form() {
     // Lean proves the create loop equals ((1 << count) - 1) << idx
     // (`CommitMask.create_correct`); check the live Rust loop against the
-    // same closed form for every valid (idx, count) pair.
-    for idx in 0..=512usize {
-        for count in 0..=(512 - idx) {
+    // same closed form for every valid (idx, count) pair. Under Miri the
+    // ~67M-assert grid is sampled with a coprime stride (the full grid
+    // still runs natively, and the property is Lean-proven).
+    let step = if cfg!(miri) { 37 } else { 1 };
+    for idx in (0..=512usize).step_by(step) {
+        for count in (0..=(512 - idx)).step_by(step) {
             let mask = lean_model::commit_mask_create_words(idx, count);
             for bit in 0..512 {
                 let expect = bit >= idx && bit < idx + count;
