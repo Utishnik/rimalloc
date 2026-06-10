@@ -76,12 +76,16 @@ Key invariants (from `types.h`):
       (~5% overhead, mirroring `MI_SECURE=3/4`)
 - [x] Ported test suite: `test-api.c`, `test-api-fill.c`, `test-stress.c`
 - [x] Miri-clean on the ported suite
-- [x] Stress (`test-stress.c` port, 32 threads × 50 iters, pthread harness
-      on both sides): within ~4-5% of C mimalloc v2.3.2 on user time
-      (6.4s vs 6.1s quiet, 7.4s vs 7.1s loaded); ahead of C at higher per-thread scales
-      (1 thread × scale 5000: 7.2s vs C's 9.1s user). The residual gap is
-      thread-churn metadata cost from the deliberate 2-cache-line page
-      header split that buys the larson/xmalloc wins below.
+- [x] Stress (`test-stress.c` port, instruction-parity harness on both
+      sides): rimalloc retires *fewer* instructions than C mimalloc v2.3.2
+      (64.2G vs 65.8G per 100 iters) but trails ~18% on user time
+      (13.1s vs 11.2s quiet). Ablation isolates the entire gap to the
+      cross-thread transfer traffic: with the bench's 25% transfer
+      exchange disabled rimalloc is *ahead* (11.05s vs 11.17s); the same
+      ablation moves C by only 0.05s. The residual is stall time on the
+      ~27M cross-thread block hand-offs (mt-CAS push, owner adoption of
+      remote-dirty chains, full-queue delayed-free pings), not
+      instruction count.
 
 Microbenchmarks (`crates/bench`, min of 3 interleaved runs, Apple M3 Max
 (16 cores, macOS 15, one background core busy during measurement), vs the
@@ -90,17 +94,23 @@ allocator — **rimalloc wins every allocator-sensitive bench**):
 
 | bench | rimalloc | mimalloc v3.3.2 | system |
 |---|---|---|---|
-| pairs (same-size alloc/free) | **0.136s** | 0.165s | 0.321s |
-| mixed (random sizes, 100k slots) | **0.348s** | 0.433s | 0.779s |
+| pairs (same-size alloc/free) | **0.132s** | 0.163s | 0.321s |
+| mixed (random sizes, 100k slots) | **0.337s** | 0.408s | 0.779s |
 | xthread (producer/consumer) | **0.191s** | 0.214s | 0.217s |
-| threads (thread churn) | **0.064s** | 0.077s | 0.122s |
-| json (serde_json parse+walk+serialize, 8 threads) | **0.285s** | 0.313s | 0.566s |
-| larson (server: random size mix, cross-thread frees) | **0.051s** | 0.085s | 0.406s |
-| xmalloc (producer/consumer free pressure) | **0.096s** | 0.153s | 0.202s |
+| threads (thread churn) | **0.058s** | 0.077s | 0.122s |
+| json (serde_json parse+walk+serialize, 8 threads) | **0.266s** | 0.290s | 0.566s |
+| larson (server: random size mix, cross-thread frees) | **0.050s** | 0.089s | 0.406s |
+| xmalloc (producer/consumer free pressure) | **0.086s** | 0.154s | 0.202s |
 | xpipe (xmalloc over `sync_channel`) | **0.048s** | 0.056s | 0.160s |
 | xring (xmalloc over lock-free SPSC ring) | **0.122s** | 0.166s | 0.235s |
 | scratch (cache-scratch false sharing; insensitive) | 0.036s | 0.036s | 0.036s |
 | regex (control: allocator-insensitive) | 0.042s | 0.038s | 0.041s |
+
+larson is at the physical floor of the benchmark: a stub allocator that
+only pops/pushes per-thread freelists (no metadata, no size bins, fully
+inlined) runs the identical loop in 0.049s in the same windows — the
+remaining time is the bench's own memset/RNG and the dependent loads on
+its ~500KB working set.
 
 Stable Rust is supported with no fast-path penalty: on Apple arm64 the
 default heap lives in a dedicated pthread TSD slot (as C mimalloc's
