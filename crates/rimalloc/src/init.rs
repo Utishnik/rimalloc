@@ -9,12 +9,23 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::heap::{Heap, Tld};
 use crate::os::OsMem;
 
-/// Unique, cheap thread id: the address of a thread-local (like mimalloc).
+/// Unique, cheap thread id. `pthread_self` rather than a thread-local's
+/// address: macOS tears down and re-instantiates `#[thread_local]` storage
+/// before pthread TSD destructors run, so a TLS address changes identity
+/// mid-teardown and exit-time frees would take the cross-thread path
+/// (leaking blocks onto the dying heap's delayed list).
 #[inline(always)]
 pub fn thread_id() -> usize {
     #[thread_local]
-    static TID: u8 = 0;
-    ptr::from_ref(&TID).addr()
+    static TID: Cell<usize> = Cell::new(0);
+    let t = TID.get();
+    if t != 0 {
+        return t;
+    }
+    // SAFETY: always callable; on macOS this is a thread-register read.
+    let t = unsafe { libc::pthread_self() as usize };
+    TID.set(t);
+    t
 }
 
 // The static empty heap: the initial default for every thread, so the

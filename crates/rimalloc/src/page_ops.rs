@@ -116,6 +116,39 @@ fn page_thread_free_collect(page: &Page) {
     page.used.set(page.used.get() - count as u16);
 }
 
+/// Assert the Lean-proven counting invariant (`FreeList.lean::Inv`) on a
+/// live page: `used + |free| + |local_free| = capacity <= reserved`.
+/// Debug builds only — list walks are linear.
+#[cfg(debug_assertions)]
+pub fn page_assert_invariant(page: &Page) {
+    if page.capacity.get() == 0 {
+        return; // not initialized yet (fresh or cleared page)
+    }
+    let count = |mut p: *mut Block| {
+        let mut n = 0usize;
+        while !p.is_null() {
+            n += 1;
+            debug_assert!(
+                n <= page.capacity.get() as usize,
+                "free list longer than capacity"
+            );
+            // SAFETY: list nodes are live blocks of this page.
+            p = unsafe { page.block_next(p) };
+        }
+        n
+    };
+    let free = count(page.free.get());
+    let local = count(page.local_free.get());
+    debug_assert_eq!(
+        page.used.get() as usize + free + local,
+        page.capacity.get() as usize,
+        "page counting invariant violated (used={} |free|={free} |local|={local} cap={})",
+        page.used.get(),
+        page.capacity.get(),
+    );
+    debug_assert!(page.capacity.get() <= page.reserved.get());
+}
+
 /// `_mi_page_free_collect`
 pub fn page_free_collect(page: &Page, force: bool) {
     if force || !page.thread_free().block().is_null() {
@@ -141,6 +174,8 @@ pub fn page_free_collect(page: &Page, force: bool) {
             page.free_is_zero.set(false);
         }
     }
+    #[cfg(debug_assertions)]
+    page_assert_invariant(page);
 }
 
 // ---------------------------------------------------------------------------

@@ -4,3 +4,7 @@ defaultTargets = ["RimallocVerify"]
 
 [[lean_lib]]
 name = "RimallocVerify"
+
+[[lean_exe]]
+name = "genvectors"
+root = "GenVectors"

@@ -53,3 +53,25 @@ pub(crate) fn error_code(msg: &str, code: i32) {
     hooks::output("\n");
     hooks::error(code);
 }
+
+/// Bridge for the Lean conformance tests (`tests/lean_conformance.rs`):
+/// exposes the exact functions the verified model mirrors, so the live
+/// implementation can be pinned to the model over its whole domain.
+pub mod lean_model {
+    /// `Bin::from_size` on a word count (what `Bins.lean::binFromWsize` models).
+    pub fn bin_from_wsize(wsize: usize) -> usize {
+        crate::bins::Bin::from_size(wsize * crate::constants::PTR_SIZE).index()
+    }
+
+    /// `BIN_WSIZE` table entry (what `Bins.lean::binWsize` models).
+    pub fn bin_wsize(bin: usize) -> usize {
+        crate::bins::BIN_WSIZE[bin]
+    }
+
+    /// `CommitMask::create` as raw words (what `CommitMask.lean::createLoop`
+    /// models).
+    pub fn commit_mask_create_words(idx: usize, count: usize) -> [usize; 8] {
+        let cm = crate::segment::CommitMask::create(idx, count);
+        cm.to_words()
+    }
+}

@@ -107,6 +107,11 @@ impl CommitMask {
         }
         cm
     }
+    /// Raw field words (for the Lean conformance bridge).
+    pub fn to_words(&self) -> [usize; COMMIT_MASK_FIELD_COUNT] {
+        core::array::from_fn(|i| self.mask[i].get())
+    }
+
     /// `_mi_commit_mask_committed_size`
     pub fn committed_size(&self, total: usize) -> usize {
         debug_assert!(total.is_multiple_of(COMMIT_MASK_BITS));
