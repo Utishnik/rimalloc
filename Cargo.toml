@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/rimalloc", "crates/bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/k/rimalloc"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "allow"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+lto = true
+codegen-units = 1

@@ -1,0 +1,21 @@
+[package]
+name = "rimalloc"
+description = "A pure-Rust port of mimalloc: a compact, fast general-purpose allocator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc = { version = "0.2", default-features = false }
+
+[features]
+default = []
+# Maintain allocation statistics (MI_STAT).
+stats = []
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+libc = "0.2"
