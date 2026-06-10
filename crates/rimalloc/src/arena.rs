@@ -105,13 +105,7 @@ impl Arena {
             return None; // >2GiB objects fall back to the OS
         }
         // multi-block: spinlock + scan within fields
-        while self
-            .claim_lock
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
+        crate::sync::spin_acquire(&self.claim_lock);
         let mut found = None;
         'scan: for (i, field) in self.blocks_inuse[..fields].iter().enumerate() {
             let cur = field.load(Ordering::Relaxed);
@@ -128,7 +122,7 @@ impl Arena {
                 }
             }
         }
-        self.claim_lock.store(false, Ordering::Release);
+        crate::sync::spin_release(&self.claim_lock);
         found
     }
 
@@ -197,16 +191,7 @@ impl Arena {
 
 /// Reserve a fresh arena. Size grows geometrically with the arena count.
 fn arena_reserve() -> Option<&'static Arena> {
-    // serialize reservations (rare)
-    while RESERVE_LOCK
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
-    let result = arena_reserve_locked();
-    RESERVE_LOCK.store(false, Ordering::Release);
-    result
+    crate::sync::spin_locked(&RESERVE_LOCK, arena_reserve_locked)
 }
 
 fn arena_reserve_locked() -> Option<&'static Arena> {
@@ -387,15 +372,9 @@ fn locked_add(
     numa_node: i32,
     is_zero: bool,
 ) -> Option<ArenaId> {
-    while RESERVE_LOCK
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
-    let r = add_arena_locked(start, blocks, mem, exclusive, numa_node, is_zero).map(|a| a.id);
-    RESERVE_LOCK.store(false, Ordering::Release);
-    r
+    crate::sync::spin_locked(&RESERVE_LOCK, || {
+        add_arena_locked(start, blocks, mem, exclusive, numa_node, is_zero).map(|a| a.id)
+    })
 }
 
 /// Address range check (`mi_is_in_heap_region` support).
@@ -434,26 +413,15 @@ pub fn try_purge(force: bool) {
 /// fork() support: hold the reservation lock and every arena's claim lock
 /// across the fork so the child's bitmaps are consistent.
 pub(crate) fn lock_for_fork() {
-    while RESERVE_LOCK
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
+    crate::sync::spin_acquire(&RESERVE_LOCK);
     for arena in arenas() {
-        while arena
-            .claim_lock
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
+        crate::sync::spin_acquire(&arena.claim_lock);
     }
 }
 
 pub(crate) fn unlock_for_fork() {
     for arena in arenas() {
-        arena.claim_lock.store(false, Ordering::Release);
+        crate::sync::spin_release(&arena.claim_lock);
     }
-    RESERVE_LOCK.store(false, Ordering::Release);
+    crate::sync::spin_release(&RESERVE_LOCK);
 }

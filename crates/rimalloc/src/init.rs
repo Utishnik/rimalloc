@@ -236,16 +236,7 @@ static TD_CACHE: TdCache = TdCache {
 const TD_CACHE_MAX: usize = 32;
 
 fn td_locked<R>(f: impl FnOnce() -> R) -> R {
-    while TD_CACHE
-        .lock
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
-    let r = f();
-    TD_CACHE.lock.store(false, Ordering::Release);
-    r
+    crate::sync::spin_locked(&TD_CACHE.lock, f)
 }
 
 fn td_cache_pop() -> Option<(*mut u8, OsMem)> {

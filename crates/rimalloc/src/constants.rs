@@ -3,11 +3,6 @@
 pub const PTR_SIZE: usize = size_of::<usize>();
 pub const PTR_SHIFT: usize = PTR_SIZE.trailing_zeros() as usize;
 
-#[allow(dead_code)]
-pub const KIB: usize = 1024;
-#[allow(dead_code)]
-pub const MIB: usize = KIB * KIB;
-
 /// Minimal alignment necessary (`MI_MAX_ALIGN_SIZE`), 16 for SSE et al.
 pub const MAX_ALIGN_SIZE: usize = 16;
 
@@ -33,8 +28,6 @@ pub const SMALL_OBJ_SIZE_MAX: usize = SMALL_PAGE_SIZE / 8; // 8 KiB
 pub const MEDIUM_OBJ_SIZE_MAX: usize = MEDIUM_PAGE_SIZE / 8; // 64 KiB
 pub const MEDIUM_OBJ_WSIZE_MAX: usize = MEDIUM_OBJ_SIZE_MAX / PTR_SIZE;
 pub const LARGE_OBJ_SIZE_MAX: usize = SEGMENT_SIZE / 2; // 16 MiB
-#[allow(dead_code)]
-pub const LARGE_OBJ_WSIZE_MAX: usize = LARGE_OBJ_SIZE_MAX / PTR_SIZE;
 
 /// `MI_SMALL_WSIZE_MAX`: max word-size served by the direct small-alloc path.
 pub const SMALL_WSIZE_MAX: usize = 128;

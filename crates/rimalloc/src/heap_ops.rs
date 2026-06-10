@@ -66,7 +66,7 @@ pub fn heap_collect_ex(heap: &Heap, collect: Collect) {
     page_ops::heap_collect_retired(heap, force);
 
     // Collect all pages owned by this thread.
-    heap_visit_pages(heap, |heap, pq, page| {
+    heap_visit_pages(heap, |_, pq, page| {
         page_ops::page_free_collect(page, collect >= Collect::Force);
         if collect == Collect::Force {
             page.segment().try_purge(true);
@@ -76,7 +76,6 @@ pub fn heap_collect_ex(heap: &Heap, collect: Collect) {
         } else if collect == Collect::Abandon {
             page_ops::page_abandon(page, pq);
         }
-        let _ = heap;
         true
     });
 
@@ -230,6 +229,12 @@ fn heap_absorb(heap: &Heap, from: &Heap) {
             page.xheap
                 .store(ptr::from_ref(heap).expose_provenance(), Ordering::Release);
             page_ops::page_use_delayed_free(page, Delayed::UseDelayedFree, false);
+            if page.in_full.get() {
+                // transfer the full-queue size accounting along with the page
+                // (`from`'s counter is wiped by heap_reset_pages below)
+                let size = page.capacity.get() as usize * page.block_size();
+                heap.pages_full_size.set(heap.pages_full_size.get() + size);
+            }
             count += 1;
             p = page.next.get();
         }

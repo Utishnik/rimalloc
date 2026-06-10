@@ -149,7 +149,7 @@ pub type Slice = Page;
 /// `rotl(ptr ^ k1, k0 % BITS) + k0` with per-page (or per-heap) random
 /// keys, detecting corrupted lists and making overwrites useless to an
 /// attacker. `null` is substituted by the list owner's address so an
-/// encoded null is not a key oracle (like C).
+/// encoded null is not a key oracle.
 #[inline(always)]
 pub fn ptr_encode(null_sub: usize, p: *mut Block, keys: &[Cell<usize>; 2]) -> *mut Block {
     if cfg!(feature = "secure") {

@@ -858,7 +858,7 @@ fn segment_os_alloc<'a>(
             is_zero,
         };
         if !is_zero {
-            // SAFETY: header zeroing before &Segment creation (see below).
+            // SAFETY: the header is zeroed below, before the reference is used.
             unsafe { ptr::write_bytes(p, 0, size_of::<Segment>()) };
         }
         // SAFETY: aligned, committed, header zeroed/zero.
@@ -1262,29 +1262,14 @@ pub mod abandoned {
     }
 
     pub(crate) fn lock_for_fork() {
-        while LIST
-            .lock
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
+        crate::sync::spin_acquire(&LIST.lock);
     }
     pub(crate) fn unlock_for_fork() {
-        LIST.lock.store(false, Ordering::Release);
+        crate::sync::spin_release(&LIST.lock);
     }
 
     fn locked<R>(f: impl FnOnce() -> R) -> R {
-        while LIST
-            .lock
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        let r = f();
-        LIST.lock.store(false, Ordering::Release);
-        r
+        crate::sync::spin_locked(&LIST.lock, f)
     }
 
     /// `_mi_arena_segment_mark_abandoned` (OS-list flavor): push at the end.

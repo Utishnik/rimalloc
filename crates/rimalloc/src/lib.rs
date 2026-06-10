@@ -34,6 +34,7 @@ mod page_ops;
 pub mod protocol;
 mod segment;
 mod stats;
+mod sync;
 mod visit;
 
 pub use api::*;

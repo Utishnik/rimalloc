@@ -10,8 +10,8 @@ use crate::segment::{Segment, SegmentKind, ptr_segment};
 
 /// `mi_check_is_double_free` (`secure` feature): if the block's first word
 /// decodes to a plausible pointer into the same page, confirm by walking
-/// the page's free lists for an exact match (like C). Reads one word of
-/// possibly-uninitialized user memory exactly like C; not run under Miri.
+/// the page's free lists for an exact match. Reads one word of possibly
+/// uninitialized user memory, so it is compiled out under Miri.
 #[cfg(all(feature = "secure", not(miri)))]
 fn check_is_double_free(page: &Page, block: *mut Block) -> bool {
     // SAFETY: block points into the page's committed area.
@@ -83,8 +83,9 @@ fn free_block_local(page: &Page, block: *mut Block, check_full: bool) {
 /// `_mi_page_ptr_unalign`: start of the block containing `p`.
 pub fn page_ptr_unalign(page: &Page, p: *mut u8) -> *mut Block {
     let diff = p.addr() - page.page_start.get().addr();
-    let adjust = if page.block_size_shift.get() != 0 {
-        diff & ((1 << page.block_size_shift.get()) - 1)
+    let shift = page.block_size_shift.get();
+    let adjust = if shift != 0 {
+        diff & ((1 << shift) - 1)
     } else {
         diff % page.block_size.get()
     };

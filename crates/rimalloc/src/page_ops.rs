@@ -111,6 +111,7 @@ pub fn page_assert_invariant(page: &Page) {
 }
 
 /// `_mi_page_free_collect`
+#[inline]
 pub fn page_free_collect(page: &Page, force: bool) {
     if force || !page.thread_free().block().is_null() {
         page_thread_free_collect(page);

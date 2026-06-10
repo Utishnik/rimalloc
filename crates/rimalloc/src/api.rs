@@ -89,6 +89,21 @@ pub fn good_size(size: usize) -> usize {
 // realloc family
 // ---------------------------------------------------------------------------
 
+/// Common tail of the realloc paths: copy into the new block (zeroing the
+/// growth tail first), free the old block.
+fn realloc_move(p: *mut u8, newp: *mut u8, oldsize: usize, newsize: usize, zero: bool) {
+    if zero && newsize > oldsize {
+        let start = oldsize.saturating_sub(size_of::<usize>());
+        // SAFETY: newp has at least newsize usable bytes.
+        unsafe { ptr::write_bytes(newp.add(start), 0, newsize - start) };
+    }
+    if newsize > 0 {
+        // SAFETY: disjoint allocations, both at least min(old,new) long.
+        unsafe { ptr::copy_nonoverlapping(p, newp, oldsize.min(newsize)) };
+    }
+    free(p);
+}
+
 /// `_mi_heap_realloc_zero`
 fn heap_realloc_zero(heap: &Heap, p: *mut u8, newsize: usize, zero: bool) -> *mut u8 {
     if p.is_null() {
@@ -101,21 +116,7 @@ fn heap_realloc_zero(heap: &Heap, p: *mut u8, newsize: usize, zero: bool) -> *mu
     }
     let newp = as_ptr(heap_malloc_zero(heap, newsize, false));
     if !newp.is_null() {
-        if zero && newsize > size {
-            // zero the tail
-            let start = if size >= size_of::<usize>() {
-                size - size_of::<usize>()
-            } else {
-                0
-            };
-            // SAFETY: newp has at least newsize usable bytes.
-            unsafe { ptr::write_bytes(newp.add(start), 0, newsize - start) };
-        }
-        if newsize > 0 {
-            // SAFETY: both regions are at least min(size, newsize) long and disjoint.
-            unsafe { ptr::copy_nonoverlapping(p, newp, size.min(newsize)) };
-        }
-        free(p);
+        realloc_move(p, newp, size, newsize, zero);
     }
     newp
 }
@@ -254,7 +255,8 @@ fn malloc_zero_aligned_at(
     if offset == 0 && alignment <= size && size <= SMALL_SIZE_MAX {
         // SAFETY: pages_free_direct entries are live or the static empty page.
         let page = unsafe { &*crate::heap::heap_get_free_small_page(heap, size + PADDING_SIZE) };
-        if !page.free.get().is_null() && page.free.get().addr() & (alignment - 1) == 0 {
+        let head = page.free.get();
+        if !head.is_null() && head.addr() & (alignment - 1) == 0 {
             return as_ptr(crate::alloc::page_malloc_zero(
                 heap,
                 page,
@@ -334,19 +336,7 @@ fn realloc_zero_aligned_at(
     }
     let newp = malloc_zero_aligned_at(heap_default_unchecked(), newsize, alignment, offset, zero);
     if !newp.is_null() {
-        let size = usable_size(p);
-        if zero && newsize > size {
-            let start = if size >= size_of::<usize>() {
-                size - size_of::<usize>()
-            } else {
-                0
-            };
-            // SAFETY: newp has at least newsize usable bytes.
-            unsafe { ptr::write_bytes(newp.add(start), 0, newsize - start) };
-        }
-        // SAFETY: disjoint allocations, both at least min(size,newsize) long.
-        unsafe { ptr::copy_nonoverlapping(p, newp, size.min(newsize)) };
-        free(p);
+        realloc_move(p, newp, usable_size(p), newsize, zero);
     }
     newp
 }
@@ -537,7 +527,7 @@ pub unsafe fn check_owned(p: *const u8) -> bool {
         return true;
     }
     // SAFETY: only reads the segment header derived from the address; a
-    // wrong address may fault, like the C version (debug-only helper).
+    // wrong address may fault (debug-only helper).
     let segment = unsafe { ptr_segment(p) };
     segment.cookie.get() == segment.as_ptr().addr() ^ 0xa5a5_5a5a_1234_5678
 }
@@ -673,8 +663,7 @@ pub unsafe fn heap_contains_block(heap: &Heap, p: *const u8) -> bool {
 ///
 /// # Safety
 /// `p` must be null or a pointer into memory obtained from this allocator.
-pub unsafe fn heap_check_owned(heap: &Heap, p: *const u8) -> bool {
-    let _ = heap;
+pub unsafe fn heap_check_owned(_heap: &Heap, p: *const u8) -> bool {
     // SAFETY: per contract.
     unsafe { check_owned(p) }
 }

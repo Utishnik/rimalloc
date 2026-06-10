@@ -359,16 +359,7 @@ static CACHE: Cache = Cache {
 static PURGE_EXPIRE: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
 
 fn cache_locked<R>(f: impl FnOnce() -> R) -> R {
-    while CACHE
-        .lock
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
-    let r = f();
-    CACHE.lock.store(false, Ordering::Release);
-    r
+    crate::sync::spin_locked(&CACHE.lock, f)
 }
 
 /// Try to cache a standard segment region; false if the cache is full or the
@@ -441,7 +432,8 @@ fn cache_purge_expired() {
         return;
     }
     // Collect candidates under the lock, purge outside it (madvise can be
-    // slow and must not extend the critical section).
+    // slow and must not extend the critical section). At most 8 regions per
+    // pass; the rest keep their purge bit and go out on a later drain.
     let mut to_purge: [(*mut u8, usize); 8] = [(ptr::null_mut(), 0); 8];
     let mut n = 0;
     cache_locked(|| {
@@ -568,12 +560,7 @@ fn fork_locks() -> [&'static AtomicBool; 2] {
 pub(crate) extern "C" fn fork_prepare() {
     crate::segment::abandoned::lock_for_fork();
     for l in fork_locks() {
-        while l
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
+        crate::sync::spin_acquire(l);
     }
     crate::arena::lock_for_fork();
 }
@@ -581,7 +568,7 @@ pub(crate) extern "C" fn fork_prepare() {
 pub(crate) extern "C" fn fork_release() {
     crate::arena::unlock_for_fork();
     for l in fork_locks() {
-        l.store(false, Ordering::Release);
+        crate::sync::spin_release(l);
     }
     crate::segment::abandoned::unlock_for_fork();
 }

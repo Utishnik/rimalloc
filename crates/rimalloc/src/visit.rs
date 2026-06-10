@@ -40,18 +40,13 @@ const MAP_WORDS: usize = MAX_BLOCKS / usize::BITS as usize;
 
 /// `_mi_heap_area_visit_blocks`: call `visitor(block, usable_size)` for
 /// every live block of `page`; stops early on `false`.
-fn area_visit_blocks(
-    area: &HeapArea,
-    page: &Page,
-    visitor: &mut impl FnMut(*mut u8, usize) -> bool,
-) -> bool {
+fn area_visit_blocks(page: &Page, visitor: &mut impl FnMut(*mut u8, usize) -> bool) -> bool {
     if page.used.get() == 0 {
         return true;
     }
     let pstart = page.start();
     let bsize = page.block_size();
     let ubsize = page.usable_block_size();
-    let _ = area;
 
     // optimize: page with one block
     if page.capacity.get() == 1 {
@@ -136,9 +131,7 @@ pub fn heap_visit_blocks(
             return false;
         }
         if visit_blocks {
-            area_visit_blocks(&area, page, &mut |block, size| {
-                visitor(&area, Some((block, size)))
-            })
+            area_visit_blocks(page, &mut |block, size| visitor(&area, Some((block, size))))
         } else {
             true
         }
