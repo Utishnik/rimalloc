@@ -230,6 +230,7 @@ fn bench_larson() -> f64 {
                         );
                         let size = MIN + pick(&mut r) % (MAX - MIN);
                         let p = std::hint::black_box(rimalloc_alloc(size));
+                        // SAFETY: `p` is a live allocation of at least `size` bytes.
                         unsafe { p.write_bytes(0xb5, size.min(128)) };
                         slots[i] = (p.addr(), size);
                     }
@@ -261,6 +262,7 @@ fn bench_xmalloc_test() -> f64 {
             for _ in 0..PER {
                 let size = (pick(&mut r) % 256) + 8;
                 let p = std::hint::black_box(rimalloc_alloc(size));
+                // SAFETY: `p` is a live allocation of at least `size >= 8` bytes.
                 unsafe { p.write_bytes(1, 8) };
                 tx.send((p.addr(), size)).unwrap();
             }
@@ -295,6 +297,7 @@ fn bench_cache_scratch() -> f64 {
                 let p = std::hint::black_box(rimalloc_alloc(OBJ));
                 for i in 0..ITERS {
                     // volatile so the cache-line traffic actually happens
+                    // SAFETY: `p` is a live allocation of `OBJ == 8` bytes.
                     unsafe { std::ptr::write_volatile(p.cast::<u64>(), i as u64) };
                 }
                 rimalloc_free_sized(p, OBJ);
@@ -309,10 +312,12 @@ fn bench_cache_scratch() -> f64 {
 
 /// Route through the selected global allocator via Vec-free raw calls.
 fn rimalloc_alloc(size: usize) -> *mut u8 {
+    // SAFETY: the layout is valid and non-zero sized.
     unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(size, 8).unwrap()) }
 }
 fn rimalloc_free_sized(p: *mut u8, size: usize) {
     if !p.is_null() {
+        // SAFETY: `p` was allocated by `rimalloc_alloc` with the same layout.
         unsafe { std::alloc::dealloc(p, std::alloc::Layout::from_size_align(size, 8).unwrap()) };
     }
 }

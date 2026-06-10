@@ -1524,7 +1524,13 @@ fn try_reclaim<'a>(
 
 /// `_mi_abandoned_collect`
 pub fn abandoned_collect(heap: &Heap, force: bool, tld: &SegmentsTld) {
-    let mut max_tries = if force { abandoned::count() } else { 1024 };
+    // One pass over the segments abandoned at entry (the C version's arena
+    // cursor visits each at most once); re-pushed segments are not revisited.
+    let mut max_tries = if force {
+        abandoned::count()
+    } else {
+        abandoned::count().min(1024)
+    };
     while max_tries > 0 {
         max_tries -= 1;
         let Some(segment) = abandoned::pop() else {
