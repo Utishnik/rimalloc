@@ -186,6 +186,137 @@ fn bench_regex() -> f64 {
     start.elapsed().as_secs_f64()
 }
 
+/// Port of mimalloc-bench `larson` (server workload): T threads each own
+/// an array of slots; every op frees a random slot and allocates a random
+/// size in its place. Periodically each thread hands its whole slot array
+/// to a fresh thread (cross-thread frees + thread churn).
+fn bench_larson() -> f64 {
+    const THREADS: usize = 8;
+    const SLOTS: usize = 1000;
+    const ROUNDS: usize = 4; // thread generations
+    const OPS: usize = 1_000_000; // per thread per generation
+    const MIN: usize = 8;
+    const MAX: usize = 1000;
+
+    let start = Instant::now();
+    let mut handles: Vec<std::thread::JoinHandle<Vec<(usize, usize)>>> = (0..THREADS)
+        .map(|t| {
+            std::thread::spawn(move || {
+                let mut r = t * 17 + 1;
+                (0..SLOTS)
+                    .map(|_| {
+                        let size = MIN + pick(&mut r) % (MAX - MIN);
+                        (rimalloc_alloc(size).addr(), size)
+                    })
+                    .collect()
+            })
+        })
+        .collect();
+
+    for round in 0..ROUNDS {
+        handles = handles
+            .into_iter()
+            .enumerate()
+            .map(|(t, h)| {
+                let slots = h.join().unwrap();
+                std::thread::spawn(move || {
+                    let mut slots = slots;
+                    let mut r = t * 31 + round * 7 + 1;
+                    for _ in 0..OPS {
+                        let i = pick(&mut r) % SLOTS;
+                        rimalloc_free_sized(
+                            std::ptr::with_exposed_provenance_mut(slots[i].0),
+                            slots[i].1,
+                        );
+                        let size = MIN + pick(&mut r) % (MAX - MIN);
+                        let p = std::hint::black_box(rimalloc_alloc(size));
+                        unsafe { p.write_bytes(0xb5, size.min(128)) };
+                        slots[i] = (p.addr(), size);
+                    }
+                    slots
+                })
+            })
+            .collect();
+    }
+    for h in handles {
+        for (a, size) in h.join().unwrap() {
+            rimalloc_free_sized(std::ptr::with_exposed_provenance_mut(a), size);
+        }
+    }
+    start.elapsed().as_secs_f64()
+}
+
+/// Port of mimalloc-bench `xmalloc-test`: producer threads allocate,
+/// consumer threads free everything they receive (pure cross-thread-free
+/// throughput).
+fn bench_xmalloc_test() -> f64 {
+    const PAIRS: usize = 4;
+    const PER: usize = 2_000_000;
+    let start = Instant::now();
+    let mut handles = Vec::new();
+    for t in 0..PAIRS {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, usize)>(4096);
+        handles.push(std::thread::spawn(move || {
+            let mut r = t + 1;
+            for _ in 0..PER {
+                let size = (pick(&mut r) % 256) + 8;
+                let p = std::hint::black_box(rimalloc_alloc(size));
+                unsafe { p.write_bytes(1, 8) };
+                tx.send((p.addr(), size)).unwrap();
+            }
+        }));
+        handles.push(std::thread::spawn(move || {
+            while let Ok((a, size)) = rx.recv() {
+                rimalloc_free_sized(std::ptr::with_exposed_provenance_mut(a), size);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    start.elapsed().as_secs_f64()
+}
+
+/// Port of Berger's `cache-scratch` (passive/active false sharing): the
+/// main thread allocates one small object per worker; each worker frees
+/// it, allocates its own, and writes it in a tight loop. Allocators that
+/// hand different threads the same cache line collapse here.
+fn bench_cache_scratch() -> f64 {
+    const THREADS: usize = 8;
+    const OBJ: usize = 8;
+    const ITERS: usize = 100_000_000;
+    let handoff: Vec<usize> = (0..THREADS).map(|_| rimalloc_alloc(OBJ).addr()).collect();
+    let start = Instant::now();
+    let handles: Vec<_> = handoff
+        .into_iter()
+        .map(|a| {
+            std::thread::spawn(move || {
+                rimalloc_free_sized(std::ptr::with_exposed_provenance_mut(a), OBJ);
+                let p = std::hint::black_box(rimalloc_alloc(OBJ));
+                for i in 0..ITERS {
+                    // volatile so the cache-line traffic actually happens
+                    unsafe { std::ptr::write_volatile(p.cast::<u64>(), i as u64) };
+                }
+                rimalloc_free_sized(p, OBJ);
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    start.elapsed().as_secs_f64()
+}
+
+/// Route through the selected global allocator via Vec-free raw calls.
+fn rimalloc_alloc(size: usize) -> *mut u8 {
+    unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(size, 8).unwrap()) }
+}
+fn rimalloc_free_sized(p: *mut u8, size: usize) {
+    if !p.is_null() {
+        unsafe { std::alloc::dealloc(p, std::alloc::Layout::from_size_align(size, 8).unwrap()) };
+    }
+}
+
 fn main() {
     let which = std::env::args().nth(1).unwrap_or_else(|| "all".into());
     let name = if cfg!(feature = "alloc-rimalloc") {
@@ -207,4 +338,7 @@ fn main() {
     run("threads", bench_threads);
     run("json", bench_json);
     run("regex", bench_regex);
+    run("larson", bench_larson);
+    run("xmalloc", bench_xmalloc_test);
+    run("scratch", bench_cache_scratch);
 }

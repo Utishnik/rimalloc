@@ -4,8 +4,8 @@
 set -e
 cd "$(dirname "$0")/../crates/rimalloc"
 TOTAL=${1:-14400}
-PER=$((TOTAL / 2))
-for target in alloc_ops heap_api; do
+PER=$((TOTAL / 3))
+for target in alloc_ops heap_api mt_ops; do
   echo "== soaking $target for ${PER}s (corpus persists in fuzz/corpus/$target) =="
   cargo +nightly fuzz run "$target" -- \
     -max_total_time="$PER" -max_len=4096 -rss_limit_mb=6144 \

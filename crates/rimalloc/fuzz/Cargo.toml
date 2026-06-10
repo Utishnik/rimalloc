@@ -26,3 +26,10 @@ path = "fuzz_targets/heap_api.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "mt_ops"
+path = "fuzz_targets/mt_ops.rs"
+test = false
+doc = false
+bench = false
