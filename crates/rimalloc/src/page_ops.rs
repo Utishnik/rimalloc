@@ -409,7 +409,7 @@ pub fn page_extend_free(page: &Page) -> bool {
 fn page_init(heap: &Heap, page: &Page, block_size: usize) {
     let segment = page.segment();
     page.set_heap(ptr::from_ref(heap).cast_mut());
-    page.block_size.set(block_size);
+    page.set_block_size(block_size);
     let (start, page_size) = segment.page_start(page);
     page.page_start.set(start);
     debug_assert!(block_size <= page_size);

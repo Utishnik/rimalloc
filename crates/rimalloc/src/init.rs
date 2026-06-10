@@ -14,6 +14,28 @@ use crate::os::OsMem;
 /// before pthread TSD destructors run, so a TLS address changes identity
 /// mid-teardown and exit-time frees would take the cross-thread path
 /// (leaking blocks onto the dying heap's delayed list).
+///
+/// On Apple arm64 this reads pthread TSD slot 0 (the pthread self pointer)
+/// straight off the thread register, like C mimalloc's
+/// `_mi_prim_thread_id`; it stays valid through TLS teardown.
+#[cfg(all(target_vendor = "apple", target_arch = "aarch64", not(miri)))]
+#[inline(always)]
+pub fn thread_id() -> usize {
+    let tcb: *const usize;
+    // SAFETY: reads the read-only thread register; no memory effects.
+    unsafe {
+        core::arch::asm!(
+            "mrs {tcb}, tpidrro_el0",
+            "bic {tcb}, {tcb}, #7",
+            tcb = out(reg) tcb,
+            options(nomem, nostack, pure, preserves_flags)
+        );
+    }
+    // SAFETY: slot 0 of the TSD block is `pthread_self`, always readable.
+    unsafe { *tcb }
+}
+
+#[cfg(not(all(target_vendor = "apple", target_arch = "aarch64", not(miri))))]
 #[inline(always)]
 pub fn thread_id() -> usize {
     let t = tls::TID.get();
@@ -113,6 +135,10 @@ mod tls {
             const { Cell::new((&raw const EMPTY_HEAP.0).cast_mut()) };
         static RNG_KEY: Cell<u64> = const { Cell::new(0) };
     }
+    #[cfg_attr(
+        all(target_vendor = "apple", target_arch = "aarch64", not(miri)),
+        allow(dead_code)
+    )]
     pub static TID: Slot<usize> = Slot(&TID_KEY);
     pub static DEFAULT_HEAP: Slot<*mut Heap> = Slot(&HEAP_KEY);
     pub static RNG: Slot<u64> = Slot(&RNG_KEY);
@@ -145,7 +171,19 @@ mod tls {
             pub static $slot: $name = $name;
         };
     }
-    slot!(TidSlot, usize, TID_RAW, TID);
+    #[cfg_attr(
+        all(target_vendor = "apple", target_arch = "aarch64", not(miri)),
+        allow(dead_code)
+    )]
+    mod tid {
+        use super::*;
+        slot!(TidSlot, usize, TID_RAW, TID);
+    }
+    #[cfg_attr(
+        all(target_vendor = "apple", target_arch = "aarch64", not(miri)),
+        allow(unused_imports)
+    )]
+    pub use tid::TID;
     slot!(HeapSlot, *mut Heap, HEAP_RAW, DEFAULT_HEAP);
     slot!(RngSlot, u64, RNG_RAW, RNG);
 }

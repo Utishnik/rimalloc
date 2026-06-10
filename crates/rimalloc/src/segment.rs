@@ -1096,6 +1096,7 @@ impl Segment {
         page.used.set(0);
         page.block_size_shift.set(0);
         page.block_size.set(1);
+        page.block_recip.set(0);
         page.heap_tag.set(heap_tag);
         page.page_start.set(ptr::null_mut());
         page.xthread_free.store(0, Ordering::Relaxed);
@@ -1607,7 +1608,7 @@ fn huge_page_alloc<'a>(
     let page = page?;
     debug_assert!(segment.used.get() == 1 && page.block_size() >= size);
     let (start, psize) = segment.page_start(page);
-    page.block_size.set(psize);
+    page.set_block_size(psize);
     debug_assert!(page.is_huge.get());
 
     // Decommit the unused prefix of very large alignments.

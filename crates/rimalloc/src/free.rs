@@ -87,7 +87,18 @@ pub fn page_ptr_unalign(page: &Page, p: *mut u8) -> *mut Block {
     let adjust = if shift != 0 {
         diff & ((1 << shift) - 1)
     } else {
-        diff % page.block_size.get()
+        let recip = page.block_recip.get();
+        if recip != 0 {
+            // Lemire fastmod, exact since `diff` and `block_size` are < 2^32
+            // whenever the reciprocal is set (the page area of any page with
+            // a < 4 GiB block size is itself < 4 GiB).
+            let low = recip.wrapping_mul(diff as u64);
+            let adjust = ((low as u128 * page.block_size.get() as u128) >> 64) as usize;
+            debug_assert_eq!(adjust, diff % page.block_size.get());
+            adjust
+        } else {
+            diff % page.block_size.get()
+        }
     };
     p.map_addr(|a| a - adjust).cast()
 }
@@ -131,16 +142,30 @@ fn free_block_delayed_mt(page: &Page, block: *mut Block) {
     );
 }
 
+/// Abandoned-segment handling for a cross-thread free: try to reclaim the
+/// segment into our heap so the free becomes local. Outlined so the hot
+/// `free_block_mt` path pays no TLS access for this rare case.
+#[cold]
+#[inline(never)]
+fn free_block_mt_reclaim(segment: &Segment, p: *mut u8) -> bool {
+    if !crate::init::thread_is_initialized() {
+        return false;
+    }
+    let heap = crate::init::heap_default();
+    if crate::segment::attempt_reclaim(heap, segment) {
+        // now it is a local free in our heap
+        free(p);
+        true
+    } else {
+        false
+    }
+}
+
 /// `mi_free_block_mt`
 fn free_block_mt(page: &Page, segment: &Segment, block: *mut Block, p: *mut u8) {
     // Try to reclaim an abandoned segment into our heap first.
-    if segment.is_abandoned() && crate::init::thread_is_initialized() {
-        let heap = crate::init::heap_default();
-        if crate::segment::attempt_reclaim(heap, segment) {
-            // now it is a local free in our heap
-            free(p);
-            return;
-        }
+    if segment.is_abandoned() && free_block_mt_reclaim(segment, p) {
+        return;
     }
     if segment.kind.get() == SegmentKind::Huge {
         crate::segment::huge_page_reset(segment, page, block);
@@ -149,6 +174,7 @@ fn free_block_mt(page: &Page, segment: &Segment, block: *mut Block, p: *mut u8) 
 }
 
 /// `mi_free_generic_mt`
+#[inline(always)]
 fn free_generic_mt(page: &Page, segment: &Segment, p: *mut u8) {
     // don't check `has_aligned` to avoid a race (issue #865)
     let block = page_ptr_unalign(page, p);

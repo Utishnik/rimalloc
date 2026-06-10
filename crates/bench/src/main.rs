@@ -279,6 +279,106 @@ fn bench_xmalloc_test() -> f64 {
     start.elapsed().as_secs_f64()
 }
 
+/// Channel-free producer/consumer ping-pong: isolates the cross-thread
+/// free pipeline (mt push + owner collect) from channel overhead.
+fn bench_xpipe() -> f64 {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const PAIRS: usize = 4;
+    const BATCH: usize = 50_000;
+    const ROUNDS: usize = 40;
+    let start = Instant::now();
+    let mut handles = Vec::new();
+    for t in 0..PAIRS {
+        let slots: &'static Vec<AtomicUsize> = Box::leak(Box::new(
+            (0..BATCH).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>(),
+        ));
+        let turn: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+        handles.push(std::thread::spawn(move || {
+            let mut r = t + 1;
+            for round in 0..ROUNDS {
+                for slot in slots.iter() {
+                    let size = (pick(&mut r) % 256) + 8;
+                    let p = std::hint::black_box(rimalloc_alloc(size));
+                    // SAFETY: `p` is a live allocation of at least 8 bytes.
+                    unsafe { p.write_bytes(1, 8) };
+                    slot.store(p.addr() << 9 | size, Ordering::Relaxed);
+                }
+                turn.store(2 * round + 1, Ordering::Release);
+                while turn.load(Ordering::Acquire) != 2 * round + 2 {
+                    std::hint::spin_loop();
+                }
+            }
+        }));
+        handles.push(std::thread::spawn(move || {
+            for round in 0..ROUNDS {
+                while turn.load(Ordering::Acquire) != 2 * round + 1 {
+                    std::hint::spin_loop();
+                }
+                for slot in slots.iter() {
+                    let v = slot.load(Ordering::Relaxed);
+                    rimalloc_free_sized(std::ptr::with_exposed_provenance_mut(v >> 9), v & 0x1ff);
+                }
+                turn.store(2 * round + 2, Ordering::Release);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    start.elapsed().as_secs_f64()
+}
+
+/// xmalloc with a lock-free SPSC ring instead of `sync_channel`: same
+/// fine-grained concurrent alloc/cross-free interplay, no parking.
+fn bench_xring() -> f64 {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const PAIRS: usize = 4;
+    const PER: usize = 2_000_000;
+    const RING: usize = 4096;
+    struct Ring {
+        slots: Vec<AtomicUsize>,
+        head: AtomicUsize,
+        tail: AtomicUsize,
+    }
+    let start = Instant::now();
+    let mut handles = Vec::new();
+    for t in 0..PAIRS {
+        let ring: &'static Ring = Box::leak(Box::new(Ring {
+            slots: (0..RING).map(|_| AtomicUsize::new(0)).collect(),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+        }));
+        handles.push(std::thread::spawn(move || {
+            let mut r = t + 1;
+            for i in 0..PER {
+                let size = (pick(&mut r) % 256) + 8;
+                let p = std::hint::black_box(rimalloc_alloc(size));
+                // SAFETY: `p` is a live allocation of at least 8 bytes.
+                unsafe { p.write_bytes(1, 8) };
+                while i - ring.tail.load(Ordering::Acquire) >= RING {
+                    std::hint::spin_loop();
+                }
+                ring.slots[i % RING].store(p.addr() << 9 | size, Ordering::Relaxed);
+                ring.head.store(i + 1, Ordering::Release);
+            }
+        }));
+        handles.push(std::thread::spawn(move || {
+            for i in 0..PER {
+                while ring.head.load(Ordering::Acquire) <= i {
+                    std::hint::spin_loop();
+                }
+                let v = ring.slots[i % RING].load(Ordering::Relaxed);
+                rimalloc_free_sized(std::ptr::with_exposed_provenance_mut(v >> 9), v & 0x1ff);
+                ring.tail.store(i + 1, Ordering::Release);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    start.elapsed().as_secs_f64()
+}
+
 /// Port of Berger's `cache-scratch` (passive/active false sharing): the
 /// main thread allocates one small object per worker; each worker frees
 /// it, allocates its own, and writes it in a tight loop. Allocators that
@@ -345,5 +445,7 @@ fn main() {
     run("regex", bench_regex);
     run("larson", bench_larson);
     run("xmalloc", bench_xmalloc_test);
+    run("xpipe", bench_xpipe);
+    run("xring", bench_xring);
     run("scratch", bench_cache_scratch);
 }

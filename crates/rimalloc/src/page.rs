@@ -100,33 +100,45 @@ impl ThreadFree {
 /// A mimalloc page. When unallocated, the same struct doubles as a slice
 /// span header (`mi_slice_t`): `slice_count`/`slice_offset` describe the
 /// span and `block_size` is 1 if used, 0 if free.
-#[repr(C)]
+///
+/// The metadata is split into two cache lines (128 bytes on Apple Silicon)
+/// so that cross-thread frees and the owner's malloc fast path do not
+/// false-share: foreign threads only touch the first line (span lookup
+/// fields, the unalign constants, and `xthread_free`), while the owner's
+/// per-allocation fields (`free`, `local_free`, `used`, queue links) live
+/// on the second.
+#[repr(C, align(128))]
 pub struct Page {
+    // ---- line 0: read (and `xthread_free`: written) by foreign threads ----
     // "Owned" by the segment:
     pub slice_count: Cell<u32>,  // slices in this page (0 if not a page)
     pub slice_offset: Cell<u32>, // byte distance to the first slice of the span
     pub is_committed: Cell<bool>,
     pub is_zero_init: Cell<bool>,
     pub is_huge: Cell<bool>,
-
-    // Layout tuned for `malloc`/`free` access:
-    pub capacity: Cell<u16>, // blocks committed
-    pub reserved: Cell<u16>, // blocks reserved in memory
     pub in_full: Cell<bool>,
     pub has_aligned: Cell<bool>,
     pub free_is_zero: Cell<bool>,
     pub retire_expire: Cell<u8>,
-
-    pub free: Cell<*mut Block>,
-    pub local_free: Cell<*mut Block>,
-    pub used: Cell<u16>,
     pub block_size_shift: Cell<u8>, // nonzero iff block_size == 1<<shift
     pub heap_tag: Cell<u8>,
+    pub capacity: Cell<u16>, // blocks committed
+    pub reserved: Cell<u16>, // blocks reserved in memory
     pub block_size: Cell<usize>,
     pub page_start: Cell<*mut u8>,
+    /// Lemire fastmod reciprocal of `block_size` (`u64::MAX / b + 1`), or 0
+    /// when unusable; lets `page_ptr_unalign` avoid a hardware divide.
+    pub block_recip: Cell<u64>,
 
     pub xthread_free: AtomicUsize,
     pub xheap: AtomicUsize,
+
+    _pad0: [u8; 64],
+
+    // ---- line 1: owner-thread hot fields ----
+    pub free: Cell<*mut Block>,
+    pub local_free: Cell<*mut Block>,
+    pub used: Cell<u16>,
 
     pub next: Cell<*mut Page>,
     pub prev: Cell<*mut Page>,
@@ -205,12 +217,26 @@ impl Page {
         heap_tag: Cell::new(0),
         block_size: Cell::new(0),
         page_start: Cell::new(ptr::null_mut()),
+        block_recip: Cell::new(0),
         xthread_free: AtomicUsize::new(0),
         xheap: AtomicUsize::new(0),
+        _pad0: [0; 64],
         next: Cell::new(ptr::null_mut()),
         prev: Cell::new(ptr::null_mut()),
         keys: [Cell::new(0), Cell::new(0)],
     };
+
+    /// Set `block_size` together with its fastmod reciprocal (valid for
+    /// `0 < b < 2^32`; otherwise `page_ptr_unalign` falls back to `%`).
+    pub fn set_block_size(&self, b: usize) {
+        debug_assert!(b > 0);
+        self.block_size.set(b);
+        self.block_recip.set(if (b as u64) < (1 << 32) {
+            u64::MAX / b as u64 + 1
+        } else {
+            0
+        });
+    }
 
     /// `_mi_page_segment`: pages live inside their segment, so mask the address.
     /// The segment mapping's provenance is exposed at allocation, so the
