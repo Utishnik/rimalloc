@@ -74,4 +74,10 @@ pub mod lean_model {
         let cm = crate::segment::CommitMask::create(idx, count);
         cm.to_words()
     }
+
+    /// Page block-area start offset (what `PageStart.lean::startOffset`
+    /// models).
+    pub fn page_start_offset(block_size: usize, pstart_addr: usize, psize: usize) -> usize {
+        crate::segment::page_start_offset(block_size, pstart_addr, psize)
+    }
 }

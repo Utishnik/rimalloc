@@ -202,6 +202,30 @@ pub struct Segment {
     pub slices: [Slice; SLICES_PER_SEGMENT + 1],
 }
 
+/// The block-area start offset within a page (pure core of
+/// `_mi_segment_page_start_from_slice`): nudge the start off OS-page/cache
+/// boundaries while keeping it `MAX_ALIGN_SIZE`-aligned and, for blocks up
+/// to `MAX_ALIGN_GUARANTEE`, block-size aligned. Modeled and verified in
+/// `verify/RimallocVerify/PageStart.lean`; the live function is pinned to
+/// the proven contract in `tests/lean_conformance.rs`.
+pub(crate) fn page_start_offset(block_size: usize, pstart_addr: usize, psize: usize) -> usize {
+    let mut start_offset = 0;
+    if block_size > 0 && block_size <= MAX_ALIGN_GUARANTEE {
+        let adjust = block_size - (pstart_addr % block_size);
+        if adjust < block_size && psize >= block_size + adjust {
+            start_offset += adjust;
+        }
+    }
+    if block_size >= PTR_SIZE {
+        if block_size <= 64 {
+            start_offset += 3 * block_size;
+        } else if block_size <= 512 {
+            start_offset += block_size;
+        }
+    }
+    align_up(start_offset, MAX_ALIGN_SIZE)
+}
+
 /// `_mi_ptr_segment`: the segment containing `p` (which must point into one).
 ///
 /// # Safety
@@ -302,21 +326,7 @@ impl Segment {
         let idx = self.slice_index(slice);
         let psize = slice.slice_count.get() as usize * SEGMENT_SLICE_SIZE;
         let pstart_addr = self.as_ptr().addr() + idx * SEGMENT_SLICE_SIZE;
-        let mut start_offset = 0;
-        if block_size > 0 && block_size <= MAX_ALIGN_GUARANTEE {
-            let adjust = block_size - (pstart_addr % block_size);
-            if adjust < block_size && psize >= block_size + adjust {
-                start_offset += adjust;
-            }
-        }
-        if block_size >= PTR_SIZE {
-            if block_size <= 64 {
-                start_offset += 3 * block_size;
-            } else if block_size <= 512 {
-                start_offset += block_size;
-            }
-        }
-        start_offset = align_up(start_offset, MAX_ALIGN_SIZE);
+        let start_offset = page_start_offset(block_size, pstart_addr, psize);
         // SAFETY: start_offset < psize, within the segment.
         let pstart = unsafe { self.as_ptr().add(idx * SEGMENT_SLICE_SIZE + start_offset) };
         (pstart, psize - start_offset)

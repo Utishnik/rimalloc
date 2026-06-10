@@ -129,6 +129,11 @@ faithful models of the allocator's core arithmetic:
   slice partition, keeps spans non-empty, and yields *maximal* spans (no
   adjacent free spans) — the soundness basis for O(1) neighbor-merging;
   splitting and state flips preserve the partition.
+- **`PageStart.lean`** — the page block-area offset: 16-alignment, the
+  block-size alignment guarantee for every *reachable* class up to
+  `MAX_ALIGN_GUARANTEE` (the proof shows reachability is essential — a
+  24-byte class would be broken by the 16-byte round-up, which is exactly
+  why ALIGN2W rounds odd word counts away), and that a block always fits.
 - **`FreeList.lean`** — the page free-list counting invariant
   (`used + |free| + |local_free| = capacity ≤ reserved`,
   `|thread_free| ≤ used`) is preserved by alloc, local free, remote free,

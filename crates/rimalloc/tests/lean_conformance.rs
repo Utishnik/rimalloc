@@ -58,3 +58,32 @@ fn commit_mask_matches_closed_form() {
         }
     }
 }
+
+#[test]
+fn page_start_offset_matches_lean_contract() {
+    // PageStart.lean proves three properties of the offset computation over
+    // every reachable bin <= MAX_ALIGN_GUARANTEE and every 16-aligned
+    // page-start residue; check the live function against the same
+    // contract over the same (exhaustive) domain.
+    for bin in 1..49usize {
+        let bs = lean_model::bin_wsize(bin) * 8;
+        let reachable = lean_model::bin_from_wsize(lean_model::bin_wsize(bin)) == bin;
+        let psize = if bs <= 8192 { 65536 } else { 524288 };
+        for k in 0..4096usize {
+            let pstart = 16 * k;
+            let off = lean_model::page_start_offset(bs, pstart, psize);
+            // pageStart_align16
+            assert_eq!(off % 16, 0, "16-alignment, bs={bs} pstart={pstart}");
+            if reachable {
+                // pageStart_blockAligned
+                assert_eq!(
+                    (pstart + off) % bs,
+                    0,
+                    "block alignment guarantee, bs={bs} pstart={pstart}"
+                );
+                // pageStart_fits
+                assert!(off + bs <= psize, "fits, bs={bs} pstart={pstart}");
+            }
+        }
+    }
+}
