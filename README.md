@@ -103,8 +103,8 @@ allocator — **rimalloc wins every allocator-sensitive bench**):
 | xthread (producer/consumer) | **0.191s** | 0.214s | 0.217s |
 | threads (thread churn) | **0.058s** | 0.077s | 0.122s |
 | json (serde_json parse+walk+serialize, 8 threads) | **0.266s** | 0.290s | 0.566s |
-| larson (server: random size mix, cross-thread frees) | **0.050s** | 0.089s | 0.406s |
-| xmalloc (producer/consumer free pressure) | **0.086s** | 0.154s | 0.202s |
+| larson (server: random size mix, cross-thread frees) | **0.040s** | 0.071s | 0.406s |
+| xmalloc (producer/consumer free pressure) | **0.063s** | 0.117s | 0.202s |
 | xpipe (xmalloc over `sync_channel`) | **0.048s** | 0.056s | 0.160s |
 | xring (xmalloc over lock-free SPSC ring) | **0.122s** | 0.166s | 0.235s |
 | scratch (cache-scratch false sharing; insensitive) | 0.036s | 0.036s | 0.036s |
