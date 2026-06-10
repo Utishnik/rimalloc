@@ -1088,8 +1088,8 @@ impl Segment {
         let heap_tag = page.heap_tag.get();
         page.capacity.set(0);
         page.reserved.set(0);
-        page.in_full.set(false);
-        page.has_aligned.set(false);
+        page.set_in_full(false);
+        page.set_has_aligned(false);
         page.free_is_zero.set(false);
         page.retire_expire.set(0);
         page.free.set(ptr::null_mut());

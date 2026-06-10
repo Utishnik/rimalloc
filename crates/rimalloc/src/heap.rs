@@ -149,7 +149,7 @@ impl Heap {
 
     /// `mi_page_bin` + `mi_heap_page_queue_of`.
     pub fn page_queue_of(&self, page: &Page) -> &PageQueue {
-        let bin = if page.in_full.get() {
+        let bin = if page.in_full() {
             Bin::FULL
         } else if page.is_huge.get() {
             Bin::HUGE
@@ -161,7 +161,7 @@ impl Heap {
 
     /// `mi_page_set_in_full` (maintains `pages_full_size`).
     pub fn page_set_in_full(&self, page: &Page, in_full: bool) {
-        if page.in_full.get() != in_full {
+        if page.in_full() != in_full {
             let size = page.capacity.get() as usize * page.block_size();
             if in_full {
                 self.pages_full_size.set(self.pages_full_size.get() + size);
@@ -169,7 +169,7 @@ impl Heap {
                 self.pages_full_size.set(self.pages_full_size.get() - size);
             }
         }
-        page.in_full.set(in_full);
+        page.set_in_full(in_full);
     }
 
     /// `mi_heap_queue_first_update`: keep `pages_free_direct` in sync after

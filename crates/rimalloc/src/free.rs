@@ -75,7 +75,7 @@ fn free_block_local(page: &Page, block: *mut Block, check_full: bool) {
     page.used.set(used);
     if used == 0 {
         page_ops::page_retire(page);
-    } else if check_full && page.in_full.get() {
+    } else if check_full && page.in_full() {
         page_ops::page_unfull(page);
     }
 }
@@ -105,7 +105,7 @@ pub fn page_ptr_unalign(page: &Page, p: *mut u8) -> *mut Block {
 
 /// `mi_free_generic_local`
 fn free_generic_local(page: &Page, p: *mut u8) {
-    let block = if page.has_aligned.get() {
+    let block = if page.has_aligned() {
         page_ptr_unalign(page, p)
     } else {
         p.cast()
@@ -197,7 +197,7 @@ pub fn free(p: *mut u8) {
     let is_local = crate::init::thread_id() == segment.thread_id.load(Ordering::Relaxed);
     let page = segment.page_of(p);
     if is_local {
-        if !page.in_full.get() && !page.has_aligned.get() {
+        if !page.full_or_aligned() {
             free_block_local(page, p.cast(), false);
         } else {
             free_generic_local(page, p);
@@ -232,7 +232,7 @@ pub fn usable_size(p: *const u8) -> usize {
     // SAFETY: p was allocated by us (API contract).
     let segment = unsafe { ptr_segment(p) };
     let page = segment.page_of(p);
-    if !page.has_aligned.get() {
+    if !page.has_aligned() {
         page.usable_block_size()
     } else {
         // adjust for interior aligned pointers

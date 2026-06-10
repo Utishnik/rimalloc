@@ -16,6 +16,15 @@ pub const NO_DELAYED: usize = 2;
 pub const NEVER_DELAYED: usize = 3;
 pub const FLAG_MASK: usize = 3;
 
+/// The thread-free word packs `count << 48 | block_ptr | delayed_flags`:
+/// pushers increment the count so the owner's collect learns the list
+/// length without walking it (pointer-chasing remote cache lines). User
+/// addresses fit in 48 bits on all supported targets, and the count cannot
+/// exceed a page's block capacity (< 2^16).
+pub const TF_COUNT_UNIT: usize = 1 << TF_COUNT_SHIFT;
+pub const TF_COUNT_SHIFT: u32 = 48;
+pub const TF_PTR_MASK: usize = TF_COUNT_UNIT - 1 - FLAG_MASK;
+
 /// Minimal atomic-word interface implemented by `core` and loom atomics.
 pub trait AtomicWord {
     fn load(&self, order: Ordering) -> usize;
@@ -63,14 +72,15 @@ pub fn mt_push<'d, A: AtomicWord, D: AtomicWord + 'd>(
     block: usize,
     mut write_next: impl FnMut(usize),
 ) {
+    debug_assert!(block & !TF_PTR_MASK == 0 && block != 0);
     let mut tfree = xthread.load(Ordering::Relaxed);
     let use_delayed = loop {
         let use_delayed = tfree & FLAG_MASK == USE_DELAYED;
         let tfreex = if use_delayed {
             (tfree & !FLAG_MASK) | FREEING
         } else {
-            write_next(tfree & !FLAG_MASK);
-            block | (tfree & FLAG_MASK)
+            write_next(tfree & TF_PTR_MASK);
+            block | (tfree & !TF_PTR_MASK).wrapping_add(TF_COUNT_UNIT)
         };
         match xthread.compare_exchange_weak(tfree, tfreex, Ordering::Release, Ordering::Relaxed) {
             Ok(_) => break use_delayed,
@@ -110,7 +120,9 @@ pub fn mt_push<'d, A: AtomicWord, D: AtomicWord + 'd>(
 }
 
 /// `_mi_page_thread_free_collect`'s atomic half: take the whole
-/// thread-free list, keeping the delayed flag bits. Returns the list head.
+/// thread-free list (head pointer *and* count), keeping the delayed flag
+/// bits. Returns the taken word: decode with `TF_PTR_MASK` /
+/// `TF_COUNT_SHIFT`.
 pub fn collect_take<A: AtomicWord>(xthread: &A) -> usize {
     let mut tfree = xthread.load(Ordering::Relaxed);
     loop {

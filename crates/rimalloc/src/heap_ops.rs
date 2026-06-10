@@ -229,7 +229,7 @@ fn heap_absorb(heap: &Heap, from: &Heap) {
             page.xheap
                 .store(ptr::from_ref(heap).expose_provenance(), Ordering::Release);
             page_ops::page_use_delayed_free(page, Delayed::UseDelayedFree, false);
-            if page.in_full.get() {
+            if page.in_full() {
                 // transfer the full-queue size accounting along with the page
                 // (`from`'s counter is wiped by heap_reset_pages below)
                 let size = page.capacity.get() as usize * page.block_size();

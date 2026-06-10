@@ -20,8 +20,8 @@ use loom::sync::Arc;
 use loom::sync::atomic::Ordering;
 use loom::thread;
 use rimalloc::protocol::{
-    AtomicWord, FREEING, NO_DELAYED, USE_DELAYED, collect_take, delayed_partial, mt_push,
-    try_use_delayed,
+    AtomicWord, FREEING, NO_DELAYED, TF_COUNT_SHIFT, TF_PTR_MASK, USE_DELAYED, collect_take,
+    delayed_partial, mt_push, try_use_delayed,
 };
 
 /// Loom-instrumented atomic word for the protocol's generic interface.
@@ -88,8 +88,10 @@ impl Storage {
     }
 
     /// `page_thread_free_collect` = the real `collect_take` + list walk.
+    /// The walk must agree with the count packed in the taken word.
     fn collect(&self) {
-        let mut n = collect_take(&self.xthread);
+        let taken = collect_take(&self.xthread);
+        let mut n = taken & TF_PTR_MASK;
         let mut count = 0usize;
         while n != 0 {
             count += 1;
@@ -97,6 +99,7 @@ impl Storage {
             self.local.with_mut(|l| unsafe { (*l).push(n) });
             n = next;
         }
+        assert_eq!(taken >> TF_COUNT_SHIFT, count, "packed count wrong");
         self.used.with_mut(|u| unsafe {
             assert!(*u >= count, "used underflow in collect");
             *u -= count;

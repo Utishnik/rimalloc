@@ -226,7 +226,7 @@ fn malloc_aligned_overalloc(
     // SAFETY: adjust < alignment <= usable slack of the oversized block.
     let aligned_p = unsafe { p.add(adjust) };
     if aligned_p != p {
-        page.has_aligned.set(true);
+        page.set_has_aligned(true);
     }
     debug_assert!((aligned_p.addr() + offset).is_multiple_of(alignment));
     if alignment > BLOCK_ALIGNMENT_MAX && zero {

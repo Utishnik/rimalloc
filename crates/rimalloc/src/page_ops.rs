@@ -46,34 +46,40 @@ pub fn page_use_delayed_free(page: &Page, delay: Delayed, override_never: bool) 
 // ---------------------------------------------------------------------------
 
 /// `_mi_page_thread_free_collect`: atomically take the cross-thread free
-/// list and append it to `local_free`.
+/// list. The pushed count rides in the taken word, so the common case
+/// (the malloc `free` list is exhausted — that is why we are collecting)
+/// adopts the chain as-is without pointer-chasing remote cache lines;
+/// only a non-empty `free` list requires walking to the tail to splice
+/// into `local_free`.
 fn page_thread_free_collect(page: &Page) {
-    let head_addr = crate::protocol::collect_take(&page.xthread_free);
-    let head: *mut Block = ptr::with_exposed_provenance_mut(head_addr);
+    let taken = crate::page::ThreadFree(crate::protocol::collect_take(&page.xthread_free));
+    let head = taken.block();
     if head.is_null() {
         return;
     }
-
-    // Find the tail and count (bounded by capacity to catch corruption).
-    let max_count = page.capacity.get() as usize;
-    let mut count = 1;
-    let mut tail = head;
-    // SAFETY: list nodes are free blocks in this page (ownership of the
-    // whole list was transferred by collect_take's AcqRel swap).
-    while let Some(next) = unsafe { page.block_next(tail).as_mut() } {
-        if count > max_count {
-            break;
-        }
-        count += 1;
-        tail = next;
-    }
-    if count > max_count || count > page.used.get() as usize {
+    let count = taken.count();
+    if count == 0 || count > page.capacity.get() as usize || count > page.used.get() as usize {
         crate::error("corrupted thread-free list");
         return;
     }
-    // SAFETY: tail is a live node of this page.
-    unsafe { page.block_set_next(tail, page.local_free.get()) };
-    page.local_free.set(head);
+    if page.free.get().is_null() {
+        page.free.set(head);
+        page.free_is_zero.set(false);
+    } else {
+        let mut tail = head;
+        for _ in 1..count {
+            // SAFETY: list nodes are free blocks in this page (ownership of
+            // the whole list was transferred by collect_take's AcqRel swap).
+            tail = unsafe { page.block_next(tail) };
+            if tail.is_null() {
+                crate::error("corrupted thread-free list");
+                return;
+            }
+        }
+        // SAFETY: tail is a live node of this page.
+        unsafe { page.block_set_next(tail, page.local_free.get()) };
+        page.local_free.set(head);
+    }
     page.used.set(page.used.get() - count as u16);
 }
 
@@ -225,8 +231,8 @@ pub fn heap_delayed_free_all(heap: &Heap) {
 
 /// `_mi_page_unfull`
 pub fn page_unfull(page: &Page) {
-    debug_assert!(page.in_full.get());
-    if !page.in_full.get() {
+    debug_assert!(page.in_full());
+    if !page.in_full() {
         return;
     }
     // SAFETY: called on the owning thread; the heap is live.
@@ -240,8 +246,8 @@ pub fn page_unfull(page: &Page) {
 
 /// `mi_page_to_full`
 fn page_to_full(page: &Page, pq: &PageQueue) {
-    debug_assert!(!page.immediate_available() && !page.in_full.get());
-    if page.in_full.get() {
+    debug_assert!(!page.immediate_available() && !page.in_full());
+    if page.in_full() {
         return;
     }
     // SAFETY: owning thread; heap is live.
@@ -283,7 +289,7 @@ pub fn page_force_abandon(page: &Page) {
 pub fn page_free(page: &Page, pq: &PageQueue, force: bool) {
     debug_assert!(page.all_free());
     debug_assert!(page.thread_free().delayed() != Delayed::Freeing);
-    page.has_aligned.set(false);
+    page.set_has_aligned(false);
     // SAFETY: owning thread; heap is live.
     let heap = unsafe { &*page.heap() };
     let segments_tld = heap.segments_tld();
@@ -296,7 +302,7 @@ pub fn page_free(page: &Page, pq: &PageQueue, force: bool) {
 /// the only page in its queue (new allocations are likely coming).
 pub fn page_retire(page: &Page) {
     debug_assert!(page.all_free());
-    page.has_aligned.set(false);
+    page.set_has_aligned(false);
     // SAFETY: owning thread; heap is live.
     let heap = unsafe { &*page.heap() };
     let pq = heap.page_queue_of(page);

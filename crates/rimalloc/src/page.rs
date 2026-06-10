@@ -78,7 +78,8 @@ impl Delayed {
     }
 }
 
-/// `mi_thread_free_t`: a block pointer with [`Delayed`] flags in the low bits.
+/// `mi_thread_free_t`: a block pointer with [`Delayed`] flags in the low
+/// bits and the list length in the top 16 (see `protocol::TF_COUNT_SHIFT`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ThreadFree(pub usize);
 
@@ -89,7 +90,11 @@ impl ThreadFree {
     }
     #[inline(always)]
     pub fn block(self) -> *mut Block {
-        ptr::with_exposed_provenance_mut(self.0 & !3)
+        ptr::with_exposed_provenance_mut(self.0 & crate::protocol::TF_PTR_MASK)
+    }
+    #[inline(always)]
+    pub fn count(self) -> usize {
+        self.0 >> crate::protocol::TF_COUNT_SHIFT
     }
     #[inline(always)]
     pub fn delayed(self) -> Delayed {
@@ -101,44 +106,52 @@ impl ThreadFree {
 /// span header (`mi_slice_t`): `slice_count`/`slice_offset` describe the
 /// span and `block_size` is 1 if used, 0 if free.
 ///
-/// The metadata is split into two cache lines (128 bytes on Apple Silicon)
-/// so that cross-thread frees and the owner's malloc fast path do not
-/// false-share: foreign threads only touch the first line (span lookup
-/// fields, the unalign constants, and `xthread_free`), while the owner's
-/// per-allocation fields (`free`, `local_free`, `used`, queue links) live
-/// on the second.
+/// The metadata is split into three cache lines (128 bytes on Apple
+/// Silicon) so concurrent cross-thread frees neither false-share with the
+/// owner's malloc fast path nor with *each other*:
+/// - line 0 is init-time-constant and read-shared (span lookup fields and
+///   the unalign constants every foreign free needs) — it stays valid in
+///   every core's cache;
+/// - line 1 holds only the contended atomics (`xthread_free`, `xheap`)
+///   that foreign frees CAS, so that traffic invalidates nothing else;
+/// - line 2 has the owner's per-allocation fields (`free`, `local_free`,
+///   `used`, queue links).
 #[repr(C, align(128))]
 pub struct Page {
-    // ---- line 0: read (and `xthread_free`: written) by foreign threads ----
+    // ---- line 0: init-constant, read by everyone ----
     // "Owned" by the segment:
     pub slice_count: Cell<u32>,  // slices in this page (0 if not a page)
     pub slice_offset: Cell<u32>, // byte distance to the first slice of the span
     pub is_committed: Cell<bool>,
     pub is_zero_init: Cell<bool>,
     pub is_huge: Cell<bool>,
-    pub in_full: Cell<bool>,
-    pub has_aligned: Cell<bool>,
-    pub free_is_zero: Cell<bool>,
-    pub retire_expire: Cell<u8>,
-    pub block_size_shift: Cell<u8>, // nonzero iff block_size == 1<<shift
     pub heap_tag: Cell<u8>,
-    pub capacity: Cell<u16>, // blocks committed
-    pub reserved: Cell<u16>, // blocks reserved in memory
+    pub block_size_shift: Cell<u8>, // nonzero iff block_size == 1<<shift
     pub block_size: Cell<usize>,
     pub page_start: Cell<*mut u8>,
     /// Lemire fastmod reciprocal of `block_size` (`u64::MAX / b + 1`), or 0
     /// when unusable; lets `page_ptr_unalign` avoid a hardware divide.
     pub block_recip: Cell<u64>,
 
+    _pad0: [u8; 88],
+
+    // ---- line 1: the atomics foreign frees write ----
     pub xthread_free: AtomicUsize,
     pub xheap: AtomicUsize,
 
-    _pad0: [u8; 64],
+    _pad1: [u8; 112],
 
-    // ---- line 1: owner-thread hot fields ----
+    // ---- line 2: owner-thread hot fields ----
     pub free: Cell<*mut Block>,
     pub local_free: Cell<*mut Block>,
     pub used: Cell<u16>,
+    pub capacity: Cell<u16>, // blocks committed
+    pub reserved: Cell<u16>, // blocks reserved in memory
+    /// Bit 0: page is in the full queue; bit 1: contains aligned (interior)
+    /// blocks. One byte so the free fast path tests both with one load.
+    flags: Cell<u8>,
+    pub free_is_zero: Cell<bool>,
+    pub retire_expire: Cell<u8>,
 
     pub next: Cell<*mut Page>,
     pub prev: Cell<*mut Page>,
@@ -206,8 +219,7 @@ impl Page {
         is_huge: Cell::new(false),
         capacity: Cell::new(0),
         reserved: Cell::new(0),
-        in_full: Cell::new(false),
-        has_aligned: Cell::new(false),
+        flags: Cell::new(0),
         free_is_zero: Cell::new(false),
         retire_expire: Cell::new(0),
         free: Cell::new(ptr::null_mut()),
@@ -220,7 +232,8 @@ impl Page {
         block_recip: Cell::new(0),
         xthread_free: AtomicUsize::new(0),
         xheap: AtomicUsize::new(0),
-        _pad0: [0; 64],
+        _pad0: [0; 88],
+        _pad1: [0; 112],
         next: Cell::new(ptr::null_mut()),
         prev: Cell::new(ptr::null_mut()),
         keys: [Cell::new(0), Cell::new(0)],
@@ -276,6 +289,39 @@ impl Page {
             // SAFETY: heap outlives its pages; tag is plain data.
             self.heap_tag.set(unsafe { (*heap).tag.get() });
         }
+    }
+
+    const FLAG_IN_FULL: u8 = 0x01;
+    const FLAG_HAS_ALIGNED: u8 = 0x02;
+
+    #[inline(always)]
+    pub fn in_full(&self) -> bool {
+        self.flags.get() & Self::FLAG_IN_FULL != 0
+    }
+
+    #[inline(always)]
+    pub fn set_in_full(&self, v: bool) {
+        let f = self.flags.get() & !Self::FLAG_IN_FULL;
+        self.flags.set(f | if v { Self::FLAG_IN_FULL } else { 0 });
+    }
+
+    #[inline(always)]
+    pub fn has_aligned(&self) -> bool {
+        self.flags.get() & Self::FLAG_HAS_ALIGNED != 0
+    }
+
+    #[inline(always)]
+    pub fn set_has_aligned(&self, v: bool) {
+        let f = self.flags.get() & !Self::FLAG_HAS_ALIGNED;
+        self.flags
+            .set(f | if v { Self::FLAG_HAS_ALIGNED } else { 0 });
+    }
+
+    /// True if the local free path must take the generic route (full-queue
+    /// bookkeeping or interior aligned pointers): a single byte test.
+    #[inline(always)]
+    pub fn full_or_aligned(&self) -> bool {
+        self.flags.get() != 0
     }
 
     /// `mi_page_all_free`: needs an up-to-date `used` count.
@@ -362,3 +408,7 @@ impl Page {
         unsafe { Block::write_next(b, enc) };
     }
 }
+
+const _: () = assert!(size_of::<Page>() == 384);
+const _: () = assert!(core::mem::offset_of!(Page, xthread_free) == 128);
+const _: () = assert!(core::mem::offset_of!(Page, free) == 256);
