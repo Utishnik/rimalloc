@@ -18,7 +18,14 @@ const MAX_BLOCK_FIELDS: usize = 8;
 const FIELD_BITS: usize = usize::BITS as usize;
 const MAX_ARENA_BLOCKS: usize = MAX_BLOCK_FIELDS * FIELD_BITS;
 
+/// Arena identifier: 0 is "none" (any arena); real ids are `index + 1`.
+pub type ArenaId = usize;
+pub const ARENA_ID_NONE: ArenaId = 0;
+
 pub struct Arena {
+    id: ArenaId,
+    exclusive: bool,
+    numa_node: i32,
     start: *mut u8,
     block_count: usize,
     #[allow(dead_code)] // owns the reservation for the process lifetime
@@ -204,9 +211,6 @@ fn arena_reserve() -> Option<&'static Arena> {
 
 fn arena_reserve_locked() -> Option<&'static Arena> {
     let n = ARENA_COUNT.load(Ordering::Acquire);
-    if n >= MAX_ARENAS {
-        return None;
-    }
     // 1 GiB, doubling every 2 arenas, capped at MAX_ARENA_BLOCKS.
     let base_blocks = if cfg!(miri) { 2 } else { 32 }; // miri: small host allocs
     let blocks = (base_blocks << (n / 2)).min(MAX_ARENA_BLOCKS);
@@ -214,15 +218,33 @@ fn arena_reserve_locked() -> Option<&'static Arena> {
     // Reserve uncommitted; blocks are committed on first claim.
     let commit = cfg!(miri);
     let (start, mem) = OsMem::alloc_aligned(size, SEGMENT_ALIGN, commit)?;
+    add_arena_locked(start, blocks, mem, false, -1, mem.is_zero)
+}
 
+/// `mi_arena_add`: publish a new arena (assumes RESERVE_LOCK is held).
+fn add_arena_locked(
+    start: *mut u8,
+    blocks: usize,
+    mem: OsMem,
+    exclusive: bool,
+    numa_node: i32,
+    is_zero: bool,
+) -> Option<&'static Arena> {
+    let n = ARENA_COUNT.load(Ordering::Acquire);
+    if n >= MAX_ARENAS || blocks == 0 {
+        return None;
+    }
     let header_size = align_up(size_of::<Arena>(), os::page_size());
     let (hp, hmem) = OsMem::alloc_aligned(header_size, os::page_size(), true)?;
     let arena_ptr = hp.cast::<Arena>();
     // SAFETY: fresh committed memory sized for an Arena.
     unsafe {
         arena_ptr.write(Arena {
+            id: n + 1,
+            exclusive,
+            numa_node,
             start,
-            block_count: blocks,
+            block_count: blocks.min(MAX_ARENA_BLOCKS),
             mem,
             purge_expire: AtomicI64::new(0),
             claim_lock: AtomicBool::new(false),
@@ -231,12 +253,40 @@ fn arena_reserve_locked() -> Option<&'static Arena> {
             blocks_committed: [const { AtomicUsize::new(0) }; MAX_BLOCK_FIELDS],
             blocks_purge: [const { AtomicUsize::new(0) }; MAX_BLOCK_FIELDS],
         });
+        if !is_zero {
+            (*arena_ptr).blocks_dirty.iter().for_each(|f| {
+                f.store(!0, Ordering::Relaxed);
+            });
+        }
+        if mem.is_committed {
+            (*arena_ptr).blocks_committed.iter().for_each(|f| {
+                f.store(!0, Ordering::Relaxed);
+            });
+        }
     }
     let _ = hmem; // header lives for the process lifetime
     ARENAS[n].store(arena_ptr, Ordering::Release);
     ARENA_COUNT.store(n + 1, Ordering::Release);
     // SAFETY: just initialized; arenas are never freed.
     Some(unsafe { &*arena_ptr })
+}
+
+/// `mi_arena_id_is_suitable`
+#[inline]
+fn id_is_suitable(id: ArenaId, exclusive: bool, req: ArenaId) -> bool {
+    (!exclusive && req == ARENA_ID_NONE) || id == req
+}
+
+/// `_mi_arena_memid_is_suitable` for an [`ArenaRef`].
+pub fn ref_is_suitable(aref: ArenaRef, req: ArenaId) -> bool {
+    // SAFETY: arenas are immortal.
+    let arena = unsafe { &*aref.arena };
+    id_is_suitable(arena.id, arena.exclusive, req)
+}
+
+/// The current NUMA node (`_mi_os_numa_node`); single-node on macOS.
+pub fn numa_node() -> i32 {
+    0
 }
 
 fn arenas() -> impl Iterator<Item = &'static Arena> {
@@ -255,24 +305,104 @@ pub struct ArenaRef {
     count: u32,
 }
 
-/// Allocate `count` contiguous arena blocks (SEGMENT_ALIGN aligned).
-/// Returns `(ptr, is_zero, is_committed, ArenaRef)`.
-pub fn alloc(count: usize) -> Option<(*mut u8, bool, ArenaRef)> {
+/// Allocate `count` contiguous arena blocks (SEGMENT_ALIGN aligned) from an
+/// arena suitable for `req` (preferring the local NUMA node).
+/// Returns `(ptr, is_zero, ArenaRef)`.
+pub fn alloc(count: usize, req: ArenaId) -> Option<(*mut u8, bool, ArenaRef)> {
     try_purge(false);
+    let node = numa_node();
     loop {
-        for arena in arenas() {
-            if let Some(index) = arena.try_claim(count) {
-                let (is_zero, _committed) = arena.prepare(index, count);
-                let aref = ArenaRef {
-                    arena: ptr::from_ref(arena),
-                    index: index as u32,
-                    count: count as u32,
-                };
-                return Some((arena.block_ptr(index), is_zero, aref));
+        // pass 1: NUMA-local (or unbound) suitable arenas; pass 2: any suitable
+        for numa_strict in [true, false] {
+            for arena in arenas() {
+                if !id_is_suitable(arena.id, arena.exclusive, req)
+                    || (numa_strict && arena.numa_node >= 0 && arena.numa_node != node)
+                {
+                    continue;
+                }
+                if let Some(index) = arena.try_claim(count) {
+                    let (is_zero, _committed) = arena.prepare(index, count);
+                    let aref = ArenaRef {
+                        arena: ptr::from_ref(arena),
+                        index: index as u32,
+                        count: count as u32,
+                    };
+                    return Some((arena.block_ptr(index), is_zero, aref));
+                }
             }
+        }
+        if req != ARENA_ID_NONE {
+            return None; // a specific arena was requested and it is full
         }
         arena_reserve()?;
     }
+}
+
+/// `mi_reserve_os_memory_ex`: reserve fresh OS memory as an arena.
+pub fn reserve_os_memory(size: usize, commit: bool, exclusive: bool) -> Option<ArenaId> {
+    let blocks = size.div_ceil(ARENA_BLOCK_SIZE);
+    let (start, mem) = OsMem::alloc_aligned(blocks * ARENA_BLOCK_SIZE, SEGMENT_ALIGN, commit)?;
+    locked_add(start, blocks, mem, exclusive, -1, mem.is_zero)
+}
+
+/// `mi_manage_os_memory_ex`: adopt externally-provided memory as an arena.
+/// The memory is never freed by rimalloc.
+///
+/// # Safety
+/// `start..start+size` must be valid, otherwise-unused memory that outlives
+/// the process's use of this allocator; `is_committed`/`is_zero` must be
+/// accurate.
+pub unsafe fn manage_os_memory(
+    start: *mut u8,
+    size: usize,
+    is_committed: bool,
+    is_zero: bool,
+    numa_node: i32,
+    exclusive: bool,
+) -> Option<ArenaId> {
+    // align inward to whole blocks
+    let astart = align_up(start.addr(), SEGMENT_ALIGN);
+    let aend = align_down(start.addr() + size, ARENA_BLOCK_SIZE.max(SEGMENT_ALIGN));
+    if aend <= astart {
+        return None;
+    }
+    let blocks = (aend - astart) / ARENA_BLOCK_SIZE;
+    let astart_ptr = start.with_addr(astart);
+    let mem = OsMem {
+        base: astart_ptr,
+        size: blocks * ARENA_BLOCK_SIZE,
+        align: SEGMENT_ALIGN,
+        is_committed,
+        is_zero,
+    };
+    astart_ptr.expose_provenance(); // segment lookups reconstruct by address
+    locked_add(astart_ptr, blocks, mem, exclusive, numa_node, is_zero)
+}
+
+fn locked_add(
+    start: *mut u8,
+    blocks: usize,
+    mem: OsMem,
+    exclusive: bool,
+    numa_node: i32,
+    is_zero: bool,
+) -> Option<ArenaId> {
+    while RESERVE_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    let r = add_arena_locked(start, blocks, mem, exclusive, numa_node, is_zero).map(|a| a.id);
+    RESERVE_LOCK.store(false, Ordering::Release);
+    r
+}
+
+/// Address range check (`mi_is_in_heap_region` support).
+pub fn contains(p: *const u8) -> bool {
+    arenas().any(|a| {
+        p.addr() >= a.start.addr() && p.addr() < a.start.addr() + a.block_count * ARENA_BLOCK_SIZE
+    })
 }
 
 /// Return blocks to their arena.

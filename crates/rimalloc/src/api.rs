@@ -384,7 +384,52 @@ pub fn recalloc_aligned(p: *mut u8, count: usize, size: usize, alignment: usize)
 
 /// `mi_heap_new`
 pub fn heap_new() -> Option<&'static Heap> {
-    crate::heap_ops::heap_new(true, 0)
+    crate::heap_ops::heap_new(true, 0, crate::arena::ARENA_ID_NONE)
+}
+
+/// `mi_heap_new_ex`: custom tag, destroy permission, and arena binding.
+pub fn heap_new_ex(tag: u8, allow_destroy: bool, arena_id: usize) -> Option<&'static Heap> {
+    crate::heap_ops::heap_new(allow_destroy, tag, arena_id)
+}
+
+/// `mi_heap_new_in_arena`: a heap allocating exclusively from `arena_id`.
+pub fn heap_new_in_arena(arena_id: usize) -> Option<&'static Heap> {
+    crate::heap_ops::heap_new(false, 0, arena_id)
+}
+
+/// `mi_reserve_os_memory_ex`: pre-reserve OS memory as an arena. Returns
+/// the arena id (use with [`heap_new_in_arena`] when `exclusive`).
+pub fn reserve_os_memory(size: usize, commit: bool, exclusive: bool) -> Option<usize> {
+    crate::arena::reserve_os_memory(size, commit, exclusive)
+}
+
+/// `mi_manage_os_memory_ex`: adopt caller-provided memory as an arena
+/// (never freed by rimalloc).
+///
+/// # Safety
+/// See [`crate::arena::manage_os_memory`].
+pub unsafe fn manage_os_memory(
+    start: *mut u8,
+    size: usize,
+    is_committed: bool,
+    is_zero: bool,
+    numa_node: i32,
+    exclusive: bool,
+) -> Option<usize> {
+    // SAFETY: per contract.
+    unsafe {
+        crate::arena::manage_os_memory(start, size, is_committed, is_zero, numa_node, exclusive)
+    }
+}
+
+/// `mi_reserve_huge_os_pages_at`: reserve `pages` 1GiB huge OS pages as an
+/// arena on `numa_node`. Returns the arena id, or `None` where huge OS
+/// pages are unsupported (e.g. macOS arm64).
+pub fn reserve_huge_os_pages_at(pages: usize, numa_node: i32) -> Option<usize> {
+    crate::os::alloc_huge_os_pages(pages).and_then(|(start, mem)| {
+        // SAFETY: fresh exclusive mapping from the OS.
+        unsafe { crate::arena::manage_os_memory(start, mem.size, true, true, numa_node, false) }
+    })
 }
 
 /// `mi_heap_get_default`
@@ -488,10 +533,19 @@ pub unsafe fn check_owned(p: *const u8) -> bool {
     if p.is_null() || p.addr() & (PTR_SIZE - 1) != 0 {
         return false;
     }
+    if crate::arena::contains(p) {
+        return true;
+    }
     // SAFETY: only reads the segment header derived from the address; a
     // wrong address may fault, like the C version (debug-only helper).
     let segment = unsafe { ptr_segment(p) };
     segment.cookie.get() == segment.as_ptr().addr() ^ 0xa5a5_5a5a_1234_5678
+}
+
+/// `mi_is_in_heap_region`: true if `p` lies inside rimalloc-managed memory
+/// (arena reservations); always safe to call.
+pub fn is_in_heap_region(p: *const u8) -> bool {
+    !p.is_null() && crate::arena::contains(p)
 }
 
 // ---------------------------------------------------------------------------
@@ -665,3 +719,5 @@ pub fn stats_print() {
 pub fn stats_write(out: &mut dyn std::io::Write) -> std::io::Result<()> {
     crate::stats::print(out)
 }
+
+pub use crate::hooks::{register_deferred_free, register_error, register_output};

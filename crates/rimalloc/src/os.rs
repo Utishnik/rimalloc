@@ -476,3 +476,76 @@ pub fn cache_collect() {
         mem.free();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Huge OS pages
+// ---------------------------------------------------------------------------
+
+/// Allocate `pages` 1GiB huge OS pages (`_mi_os_alloc_huge_os_pages`).
+/// Supported on Linux via `MAP_HUGETLB`; unsupported elsewhere (returns
+/// `None`, like mimalloc's graceful fallback).
+#[cfg(all(target_os = "linux", not(miri)))]
+pub fn alloc_huge_os_pages(pages: usize) -> Option<(*mut u8, OsMem)> {
+    let size = pages << 30;
+    const MAP_HUGE_1GB: libc::c_int = 30 << 26; // MAP_HUGE_SHIFT
+    // SAFETY: anonymous huge-page mapping.
+    let p = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_HUGETLB | MAP_HUGE_1GB,
+            -1,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        return None;
+    }
+    let p: *mut u8 = p.cast();
+    p.expose_provenance();
+    Some((
+        p,
+        OsMem {
+            base: p,
+            size,
+            align: 1 << 30,
+            is_committed: true,
+            is_zero: true,
+        },
+    ))
+}
+
+#[cfg(not(all(target_os = "linux", not(miri))))]
+pub fn alloc_huge_os_pages(_pages: usize) -> Option<(*mut u8, OsMem)> {
+    None // no huge OS page support on this platform
+}
+
+/// Make a range inaccessible (`_mi_os_protect`); no-op under Miri.
+///
+/// # Safety
+/// `p..p+size` must lie within an owned, committed mapping with no live
+/// references.
+pub unsafe fn protect(p: *mut u8, size: usize) {
+    #[cfg(not(miri))]
+    // SAFETY: per caller contract.
+    unsafe {
+        libc::mprotect(p.cast(), size, libc::PROT_NONE);
+    }
+    #[cfg(miri)]
+    let _ = (p, size);
+}
+
+/// Restore read/write access (`_mi_os_unprotect`); no-op under Miri.
+///
+/// # Safety
+/// `p..p+size` must lie within an owned mapping.
+pub unsafe fn unprotect(p: *mut u8, size: usize) {
+    #[cfg(not(miri))]
+    // SAFETY: per caller contract.
+    unsafe {
+        libc::mprotect(p.cast(), size, libc::PROT_READ | libc::PROT_WRITE);
+    }
+    #[cfg(miri)]
+    let _ = (p, size);
+}

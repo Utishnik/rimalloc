@@ -75,6 +75,8 @@ pub struct Heap {
     pub next: Cell<*mut Heap>,
     pub no_reclaim: Cell<bool>,
     pub tag: Cell<u8>,
+    /// Preferred/required arena (`mi_heap_t.arena_id`; 0 = any).
+    pub arena_id: Cell<usize>,
     pub pages_free_direct: [Cell<*mut Page>; PAGES_DIRECT],
     pub pages: [PageQueue; BIN_FULL + 1],
 }
@@ -111,6 +113,7 @@ impl Heap {
             next: Cell::new(ptr::null_mut()),
             no_reclaim: Cell::new(false),
             tag: Cell::new(0),
+            arena_id: Cell::new(0),
             pages_free_direct: [const { Cell::new(ptr::null_mut()) }; PAGES_DIRECT],
             pages: core::array::from_fn(|bin| PageQueue {
                 first: Cell::new(ptr::null_mut()),

@@ -222,6 +222,14 @@ pub unsafe fn ptr_page<'a>(p: *const u8) -> &'a Page {
 }
 
 impl Segment {
+    /// `_mi_arena_memid_is_suitable` on this segment's memory.
+    pub fn memid_suitable(&self, req: crate::arena::ArenaId) -> bool {
+        match self.memid.get().source {
+            MemSource::Arena(aref) => crate::arena::ref_is_suitable(aref, req),
+            MemSource::Os => req == crate::arena::ARENA_ID_NONE,
+        }
+    }
+
     /// Base address of the segment mapping, carrying provenance over the
     /// whole (exposed) mapping rather than just the header struct.
     #[inline(always)]
@@ -732,7 +740,11 @@ impl Segment {
 }
 
 /// `mi_segments_page_find_and_allocate`: best-fit search in the span queues.
-fn page_find_and_allocate<'a>(slice_count: usize, tld: &SegmentsTld) -> Option<&'a Page> {
+fn page_find_and_allocate<'a>(
+    slice_count: usize,
+    req_arena: crate::arena::ArenaId,
+    tld: &SegmentsTld,
+) -> Option<&'a Page> {
     debug_assert!(slice_count * SEGMENT_SLICE_SIZE <= LARGE_OBJ_SIZE_MAX);
     let start_bin = slice_bin(slice_count);
     let slice_count = slice_count.max(1);
@@ -740,7 +752,9 @@ fn page_find_and_allocate<'a>(slice_count: usize, tld: &SegmentsTld) -> Option<&
         let mut p = sq.first.get();
         // SAFETY: queue nodes are live slices in live segments.
         while let Some(slice) = unsafe { p.as_ref() } {
-            if slice.slice_count.get() as usize >= slice_count {
+            if slice.slice_count.get() as usize >= slice_count
+                && slice.segment().memid_suitable(req_arena)
+            {
                 let segment = slice.segment();
                 sq.delete(slice);
                 if slice.slice_count.get() as usize > slice_count {
@@ -770,17 +784,24 @@ fn page_find_and_allocate<'a>(slice_count: usize, tld: &SegmentsTld) -> Option<&
 // ---------------------------------------------------------------------------
 
 /// `mi_segment_calculate_slices`
-fn calculate_slices(required: usize) -> (usize, usize) {
+fn calculate_slices(mut required: usize) -> (usize, usize) {
     let page_size = os::page_size();
-    let isize_ = align_up(
-        align_up(size_of::<Segment>(), page_size),
-        SEGMENT_SLICE_SIZE,
-    );
+    let mut isize_ = align_up(size_of::<Segment>(), page_size);
+    let mut guardsize = 0;
+    if cfg!(feature = "secure") {
+        // a protected page between the segment info and the page data,
+        // and one at the end of the segment
+        guardsize = page_size;
+        if required > 0 {
+            required = align_up(required, SEGMENT_SLICE_SIZE) + page_size;
+        }
+    }
+    isize_ = align_up(isize_ + guardsize, SEGMENT_SLICE_SIZE);
     let info_slices = isize_ / SEGMENT_SLICE_SIZE;
     let segment_size = if required == 0 {
         SEGMENT_SIZE
     } else {
-        align_up(required + isize_, SEGMENT_SLICE_SIZE)
+        align_up(required + isize_ + guardsize, SEGMENT_SLICE_SIZE)
     };
     (segment_size / SEGMENT_SLICE_SIZE, info_slices)
 }
@@ -792,6 +813,7 @@ fn segment_os_alloc<'a>(
     info_slices: usize,
     commit: bool,
     required: usize,
+    req_arena: crate::arena::ArenaId,
     tld: &SegmentsTld,
 ) -> Option<(&'a Segment, usize)> {
     let mut alignment = SEGMENT_ALIGN;
@@ -811,7 +833,7 @@ fn segment_os_alloc<'a>(
         && alignment == SEGMENT_ALIGN
         && segment_size.is_multiple_of(crate::arena::ARENA_BLOCK_SIZE)
         && let Some((p, is_zero, aref)) =
-            crate::arena::alloc(segment_size / crate::arena::ARENA_BLOCK_SIZE)
+            crate::arena::alloc(segment_size / crate::arena::ARENA_BLOCK_SIZE, req_arena)
     {
         let mem = OsMem {
             base: p,
@@ -904,6 +926,7 @@ fn segment_os_alloc<'a>(
 fn segment_alloc<'a>(
     required: usize,
     page_alignment: usize,
+    req_arena: crate::arena::ArenaId,
     tld: &SegmentsTld,
 ) -> Option<(&'a Segment, Option<&'a Page>)> {
     let (segment_slices, info_slices) = calculate_slices(required);
@@ -918,10 +941,34 @@ fn segment_alloc<'a>(
         info_slices,
         commit,
         required,
+        req_arena,
         tld,
     )?;
 
-    let slice_entries = segment_slices.min(SLICES_PER_SEGMENT);
+    let mut slice_entries = segment_slices.min(SLICES_PER_SEGMENT);
+    let mut guard_slices = 0;
+    if cfg!(feature = "secure") {
+        // Guard page between the segment metadata and the page data, and
+        // one at the very end of the segment; a trailing slice is
+        // sacrificed so the guard never overlaps usable block area.
+        let ps = os::page_size();
+        let info_size = info_slices * SEGMENT_SLICE_SIZE;
+        let seg_size = segment_slices * SEGMENT_SLICE_SIZE; // true size (huge > 32MiB)
+        // SAFETY: both pages are inside our mapping; the end page is
+        // committed first if the segment was reserved lazily.
+        unsafe {
+            os::protect(segment.as_ptr().add(info_size - ps), ps);
+            let end = segment.as_ptr().add(seg_size - ps);
+            if !commit {
+                os::commit(end, ps);
+            }
+            os::protect(end, ps);
+        }
+        if slice_entries == segment_slices {
+            slice_entries -= 1; // don't use the last slice
+        }
+        guard_slices = 1;
+    }
     segment.segment_slices.set(segment_slices);
     segment.segment_info_slices.set(info_slices);
     segment
@@ -946,7 +993,8 @@ fn segment_alloc<'a>(
         segment.span_free(info_slices, slice_entries - info_slices, false, tld);
         Some((segment, None))
     } else {
-        let huge = segment.span_allocate(info_slices, segment_slices - info_slices)?;
+        let huge =
+            segment.span_allocate(info_slices, segment_slices - info_slices - guard_slices)?;
         Some((segment, Some(huge)))
     }
 }
@@ -958,6 +1006,15 @@ fn segment_os_free(segment: &Segment, tld: &SegmentsTld) {
     if segment.was_reclaimed.get() {
         tld.reclaim_count.set(tld.reclaim_count.get() - 1);
         segment.was_reclaimed.set(false);
+    }
+    if cfg!(feature = "secure") {
+        // Remove the guard pages so the memory can be recycled.
+        let ps = os::page_size();
+        // SAFETY: the same ranges protected in segment_alloc.
+        unsafe {
+            os::unprotect(segment.as_ptr().add(segment.info_size() - ps), ps);
+            os::unprotect(segment.as_ptr().add(segment.size() - ps), ps);
+        }
     }
     let memid = segment.memid.get();
     match memid.source {
@@ -1316,7 +1373,7 @@ fn segment_reclaim<'a>(
 /// `_mi_segment_attempt_reclaim`: called on a cross-thread free into an
 /// abandoned segment.
 pub fn attempt_reclaim(heap: &Heap, segment: &Segment) -> bool {
-    if !segment.is_abandoned() {
+    if !segment.is_abandoned() || !segment.memid_suitable(heap.arena_id.get()) {
         return false;
     }
     let target = options::target_segments_per_thread();
@@ -1428,7 +1485,7 @@ fn reclaim_or_alloc<'a>(
     if let Some(segment) = segment {
         return Some(segment);
     }
-    segment_alloc(0, 0, tld).map(|(s, _)| s)
+    segment_alloc(0, 0, heap.arena_id.get(), tld).map(|(s, _)| s)
 }
 
 /// `mi_segments_page_alloc`
@@ -1448,7 +1505,7 @@ fn segments_page_alloc<'a>(
     );
     let slices_needed = page_size / SEGMENT_SLICE_SIZE;
     loop {
-        if let Some(page) = page_find_and_allocate(slices_needed, tld) {
+        if let Some(page) = page_find_and_allocate(slices_needed, heap.arena_id.get(), tld) {
             page.segment().try_purge(false);
             return Some(page);
         }
@@ -1457,8 +1514,13 @@ fn segments_page_alloc<'a>(
 }
 
 /// `mi_segment_huge_page_alloc`
-fn huge_page_alloc<'a>(size: usize, page_alignment: usize, tld: &SegmentsTld) -> Option<&'a Page> {
-    let (segment, page) = segment_alloc(size, page_alignment, tld)?;
+fn huge_page_alloc<'a>(
+    size: usize,
+    page_alignment: usize,
+    req_arena: crate::arena::ArenaId,
+    tld: &SegmentsTld,
+) -> Option<&'a Page> {
+    let (segment, page) = segment_alloc(size, page_alignment, req_arena, tld)?;
     let page = page?;
     debug_assert!(segment.used.get() == 1 && page.block_size() >= size);
     let (start, psize) = segment.page_start(page);
@@ -1505,7 +1567,7 @@ pub fn segment_page_alloc<'a>(
     let page = if page_alignment > BLOCK_ALIGNMENT_MAX {
         debug_assert!(is_power_of_two(page_alignment));
         let page_alignment = page_alignment.max(SEGMENT_SIZE);
-        huge_page_alloc(block_size, page_alignment, tld)?
+        huge_page_alloc(block_size, page_alignment, heap.arena_id.get(), tld)?
     } else if block_size <= SMALL_OBJ_SIZE_MAX {
         segments_page_alloc(heap, block_size, block_size, tld)?
     } else if block_size <= MEDIUM_OBJ_SIZE_MAX {
@@ -1513,7 +1575,7 @@ pub fn segment_page_alloc<'a>(
     } else if block_size <= LARGE_OBJ_SIZE_MAX {
         segments_page_alloc(heap, block_size, block_size, tld)?
     } else {
-        huge_page_alloc(block_size, page_alignment, tld)?
+        huge_page_alloc(block_size, page_alignment, heap.arena_id.get(), tld)?
     };
     Some(page)
 }

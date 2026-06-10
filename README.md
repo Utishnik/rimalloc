@@ -90,13 +90,22 @@ bundling C mimalloc **v3.3.2** and the macOS system allocator —
 | xthread (producer/consumer) | **0.178s** | 0.189s | 0.255s |
 | threads (thread churn) | **0.058s** | 0.067s | 0.120s |
 
+- [x] `reserve_os_memory` / `manage_os_memory` (adopt external memory),
+      exclusive arenas, `heap_new_in_arena` / `heap_new_ex` (heap tags),
+      NUMA plumbing, huge OS pages API (Linux `MAP_HUGETLB`; graceful
+      fallback elsewhere)
+- [x] Guard pages under `secure`: a protected page between segment
+      metadata and page data plus one at the segment end (`MI_SECURE>=1`)
+- [x] `register_deferred_free` / `register_output` / `register_error`
+      hooks (heartbeat-driven, recursion-guarded, provenance-correct)
+- [x] `is_in_heap_region`
+
 ### Parity gaps / roadmap
 
-- `mi_reserve_os_memory` / `mi_manage_os_memory`, NUMA affinity, huge OS
-  pages (1GiB), exclusive arenas, `mi_heap_new_in_arena`.
-- Guard pages (`MI_SECURE=5`) and debug fill patterns.
-- `mi_register_*` hooks (deferred free, output, error).
-- Page-granular purging inside live segments (C's remaining peak-RSS edge).
+- Debug fill patterns (`MI_DEBUG` uninit/freed byte stamping).
+- Per-page guard pages (`MI_SECURE=5`'s most expensive level).
+- Page-granular purging inside live segments is ported; tuning it to match
+  C's burst peak-RSS exactly remains.
 - First-class heaps as a typed Rust API (`Heap` is already exposed).
 - Secure mode (free-list encoding, guard pages), debug fill patterns.
 - Extend the Lean verification beyond the current proofs.

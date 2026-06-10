@@ -60,6 +60,7 @@ const fn heap_empty_const(empty_page: *mut crate::page::Page) -> Heap {
         next: Cell::new(ptr::null_mut()),
         no_reclaim: Cell::new(false),
         tag: Cell::new(0),
+        arena_id: Cell::new(0),
         // SAFETY: Cell<T> is repr(transparent) over T.
         pages_free_direct: unsafe {
             core::mem::transmute::<
@@ -268,7 +269,7 @@ pub fn thread_init() {
         let heap = &raw mut (*td).heap;
         let tld = &raw mut (*td).tld;
         (*tld).heap_backing.set(heap);
-        crate::heap_ops::heap_init(&*heap, tld, false, 0);
+        crate::heap_ops::heap_init(&*heap, tld, false, 0, 0);
         DEFAULT_HEAP.set(heap);
     }
     THREAD_COUNT.fetch_add(1, Ordering::Relaxed);

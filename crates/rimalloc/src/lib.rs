@@ -26,6 +26,7 @@ mod constants;
 mod free;
 mod heap;
 mod heap_ops;
+pub mod hooks;
 mod init;
 pub mod options;
 mod os;
@@ -40,12 +41,15 @@ pub use bins::good_size as mi_good_size;
 pub use heap::Heap;
 pub use visit::{HeapArea, heap_visit_blocks};
 
-/// `_mi_error_message`: write to stderr without allocating.
+/// `_mi_error_message`: route to the registered output/error hooks
+/// (stderr by default) without allocating.
 pub(crate) fn error(msg: &str) {
-    // SAFETY: plain write(2) to stderr.
-    unsafe {
-        libc::write(2, "rimalloc: error: ".as_ptr().cast(), 17);
-        libc::write(2, msg.as_ptr().cast(), msg.len());
-        libc::write(2, "\n".as_ptr().cast(), 1);
-    }
+    error_code(msg, libc::EFAULT)
+}
+
+pub(crate) fn error_code(msg: &str, code: i32) {
+    hooks::output("rimalloc: error: ");
+    hooks::output(msg);
+    hooks::output("\n");
+    hooks::error(code);
 }

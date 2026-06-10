@@ -594,6 +594,7 @@ pub fn malloc_generic(
         heap.generic_collect_count
             .set(heap.generic_collect_count.get() + heap.generic_count.get());
         heap.generic_count.set(0);
+        crate::hooks::deferred_free(heap, false);
         heap_delayed_free_partial(heap);
         if heap.generic_collect_count.get() >= 10000 {
             heap.generic_collect_count.set(0);

@@ -42,6 +42,7 @@ pub fn heap_collect_ex(heap: &Heap, collect: Collect) {
         return;
     }
     let force = collect >= Collect::Force;
+    crate::hooks::deferred_free(heap, force);
 
     // The backing heap reclaims all abandoned segments on a forced collect
     // (end-of-program): if all memory is freed by now, all segments free too.
@@ -143,7 +144,13 @@ pub fn heap_is_backing(heap: &Heap) -> bool {
 }
 
 /// `_mi_heap_init` for a fresh (non-backing) heap.
-pub fn heap_init(heap: &Heap, tld: *mut crate::heap::Tld, no_reclaim: bool, tag: u8) {
+pub fn heap_init(
+    heap: &Heap,
+    tld: *mut crate::heap::Tld,
+    no_reclaim: bool,
+    tag: u8,
+    arena_id: usize,
+) {
     heap.tld.set(tld);
     heap.thread_id.set(crate::init::thread_id());
     heap.cookie.set(crate::init::random_next() | 1);
@@ -151,6 +158,7 @@ pub fn heap_init(heap: &Heap, tld: *mut crate::heap::Tld, no_reclaim: bool, tag:
     heap.keys[1].set(crate::init::random_next());
     heap.no_reclaim.set(no_reclaim);
     heap.tag.set(tag);
+    heap.arena_id.set(arena_id);
     heap.init_direct_pages();
     // push on the thread-local heaps list
     // SAFETY: tld is owned by this thread.
@@ -161,7 +169,7 @@ pub fn heap_init(heap: &Heap, tld: *mut crate::heap::Tld, no_reclaim: bool, tag:
 }
 
 /// `mi_heap_new_ex`
-pub fn heap_new(allow_destroy: bool, tag: u8) -> Option<&'static Heap> {
+pub fn heap_new(allow_destroy: bool, tag: u8, arena_id: usize) -> Option<&'static Heap> {
     let bheap = crate::init::heap_default();
     let p = crate::alloc::heap_malloc_zero(bheap, size_of::<Heap>(), false)?;
     let heap_ptr = p.as_ptr().cast::<Heap>();
@@ -169,7 +177,7 @@ pub fn heap_new(allow_destroy: bool, tag: u8) -> Option<&'static Heap> {
     unsafe { heap_ptr.write(Heap::new_empty()) };
     // SAFETY: just initialized above.
     let heap = unsafe { &*heap_ptr };
-    heap_init(heap, bheap.tld.get(), allow_destroy, tag);
+    heap_init(heap, bheap.tld.get(), allow_destroy, tag, arena_id);
     Some(heap)
 }
 
