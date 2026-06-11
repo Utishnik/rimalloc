@@ -390,6 +390,35 @@ pub(crate) fn td_cache_lock() -> &'static core::sync::atomic::AtomicBool {
     &TD_CACHE.lock
 }
 
+/// Register the `pthread_atfork` handlers that hold every allocator lock
+/// across `fork()`. This MUST run before any thread or fork exists, so it
+/// lives in a load-time constructor (`register_fork_handlers`); doing it
+/// lazily on first allocation lets a fork race a half-registered or
+/// orphaned-lock state into the child. Split out so the `cfg(miri)`
+/// fallback (no constructor support under the interpreter) can reuse it.
+#[cfg(not(miri))]
+fn register_fork_handlers() {
+    // SAFETY: a plain libc call with three valid handler fns; the handlers
+    // only touch allocator spinlocks and never allocate.
+    unsafe {
+        libc::pthread_atfork(
+            Some(crate::os::fork_prepare),
+            Some(crate::os::fork_release),
+            Some(crate::os::fork_release),
+        );
+    }
+}
+
+/// Runs at image load, before `main` and before any thread or fork exists,
+/// so the atfork handlers are always registered ahead of any `fork()`. The
+/// body is a single libc call and never allocates, so it is safe even when
+/// `rimalloc` is the `#[global_allocator]` (the allocator is not used yet).
+#[cfg(not(miri))]
+#[ctor::ctor(unsafe)]
+fn fork_handler_ctor() {
+    register_fork_handlers();
+}
+
 fn ensure_process_init() {
     static ONCE: AtomicUsize = AtomicUsize::new(0);
     if ONCE.swap(1, Ordering::AcqRel) == 0 {
@@ -398,8 +427,13 @@ fn ensure_process_init() {
             let mut key: libc::pthread_key_t = 0;
             libc::pthread_key_create(&mut key, Some(thread_done_callback));
             THREAD_KEY.store(key as usize, Ordering::Release);
-            // Hold every allocator lock across fork() so the child's
-            // snapshot of the global lists/bitmaps is consistent.
+        }
+        // Under Miri there is no load-time constructor (it is an
+        // interpreter) and no `fork`, so register the handlers lazily here
+        // as a fallback; the real fix is the `fork_handler_ctor` above.
+        #[cfg(miri)]
+        // SAFETY: valid handler fns; under Miri these are never invoked.
+        unsafe {
             libc::pthread_atfork(
                 Some(crate::os::fork_prepare),
                 Some(crate::os::fork_release),

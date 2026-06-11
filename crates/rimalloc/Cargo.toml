@@ -8,6 +8,9 @@ repository.workspace = true
 
 [dependencies]
 libc = { version = "0.2", default-features = false }
+# Load-time constructor to register `pthread_atfork` before any thread or
+# fork exists; only the proc-macro attribute is needed (no priority).
+ctor = { version = "1.0.7", default-features = false, features = ["proc_macro", "std"] }
 
 [features]
 default = []
