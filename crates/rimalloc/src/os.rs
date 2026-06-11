@@ -209,7 +209,6 @@ pub unsafe fn commit(p: *mut u8, size: usize) -> bool {
 /// `p..p+size` must lie within a single [`OsMem`] region and have no live
 /// references.
 #[cfg(not(miri))]
-#[allow(dead_code)]
 pub unsafe fn decommit(p: *mut u8, size: usize) {
     let (p, size) = page_span(p, size, false);
     if size == 0 {
@@ -297,12 +296,13 @@ static PENDING: AtomicPtr<PendingFree> = AtomicPtr::new(ptr::null_mut());
 /// Queue an [`OsMem`] region for deallocation at the next [`drain_deferred`].
 pub fn defer_free(mem: OsMem) {
     // SAFETY: dead region; ensure the tail page is committed (lazily
-    // committed segments may have an uncommitted tail).
+    // committed segments may have an uncommitted tail, and decommit-mode
+    // purges may have dropped it). Stat-balanced: the region's committed
+    // bytes were already counted out by the caller.
     let node = unsafe {
         let node = tail_node::<PendingFree>(&mem);
-        if !mem.is_committed {
-            commit(node.cast(), 64);
-        }
+        commit(node.cast(), 64);
+        crate::stats::STATS.committed.decrease(page_size());
         node
     };
     let mut head = PENDING.load(Ordering::Relaxed);
@@ -380,8 +380,9 @@ pub fn cache_push(mem: OsMem, standard: bool, committed_size: usize) -> bool {
         return false;
     }
     // Ensure the whole mapping is committed (cached regions are handed out
-    // as fully committed).
-    if !mem.is_committed {
+    // as fully committed): lazily committed segments may have uncommitted
+    // ranges and decommit-mode purges may have dropped some.
+    if !mem.is_committed || crate::options::purge_decommits() != 0 {
         // SAFETY: we own the dead region.
         unsafe { commit(mem.base, mem.size) };
         // commit() counted the whole range; the caller's already-committed

@@ -183,12 +183,28 @@ impl Arena {
                 while bit + run_len < FIELD_BITS && m & (1 << (bit + run_len)) != 0 {
                     run_len += 1;
                 }
+                let run = field_mask(run_start, run_len);
                 let index = fi * FIELD_BITS + run_start;
-                // SAFETY: free blocks; contents may be discarded.
-                unsafe {
-                    os::reset(self.block_ptr(index), run_len * ARENA_BLOCK_SIZE);
+                if options::purge_decommits() != 0 {
+                    // Take the run out of circulation while decommitting:
+                    // a concurrent claim that saw the committed bits set
+                    // must not touch memory mid-decommit. Skip runs that
+                    // were (re)claimed since the purgeable snapshot.
+                    if self.blocks_inuse[fi].fetch_or(run, Ordering::AcqRel) & run == 0 {
+                        self.blocks_committed[fi].fetch_and(!run, Ordering::AcqRel);
+                        // SAFETY: free blocks, exclusively held by us.
+                        unsafe {
+                            os::decommit(self.block_ptr(index), run_len * ARENA_BLOCK_SIZE);
+                        }
+                        self.blocks_inuse[fi].fetch_and(!run, Ordering::AcqRel);
+                    }
+                } else {
+                    // SAFETY: free blocks; contents may be discarded.
+                    unsafe {
+                        os::reset(self.block_ptr(index), run_len * ARENA_BLOCK_SIZE);
+                    }
                 }
-                m &= !field_mask(run_start, run_len);
+                m &= !run;
             }
         }
         self.purge_expire.store(0, Ordering::Relaxed);
@@ -402,9 +418,22 @@ pub fn contains(p: *const u8) -> bool {
 }
 
 /// Return blocks to their arena.
-pub fn free(aref: ArenaRef) {
+pub fn free(aref: ArenaRef, all_committed: bool, committed_size: usize) {
     // SAFETY: arenas are immortal.
     let arena = unsafe { &*aref.arena };
+    if !all_committed {
+        // The dying segment decommitted parts of this range (the arena
+        // tracks commitment at block granularity): mark the whole range
+        // uncommitted so the next claim recommits it (C `_mi_arena_free`),
+        // and count out the bytes that were still committed.
+        let (fi, bit) = (
+            aref.index as usize / FIELD_BITS,
+            aref.index as usize % FIELD_BITS,
+        );
+        arena.blocks_committed[fi]
+            .fetch_and(!field_mask(bit, aref.count as usize), Ordering::AcqRel);
+        crate::stats::STATS.committed.decrease(committed_size);
+    }
     arena.release(aref.index as usize, aref.count as usize);
 }
 

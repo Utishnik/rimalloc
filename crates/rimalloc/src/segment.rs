@@ -418,7 +418,15 @@ impl Segment {
             return true;
         }
         debug_assert!(self.kind.get() != SegmentKind::Huge);
-        self.commit(p, size)
+        let ok = self.commit(p, size);
+        debug_assert!(
+            !ok || {
+                let (_, fs, mask) = self.commit_range_mask(false, p, size);
+                fs == 0 || self.commit_mask.all_set(&mask)
+            },
+            "ensure_committed left range uncovered"
+        );
+        ok
     }
 
     /// `mi_segment_purge`
@@ -432,8 +440,21 @@ impl Segment {
         }
         if self.commit_mask.any_set(&mask) {
             debug_assert!(self.allow_decommit.get());
-            // SAFETY: purged ranges hold no live blocks (callers guarantee).
-            unsafe { os::reset(start, full_size) };
+            if options::purge_decommits() != 0 {
+                // os::decommit counts out the whole range; the holes in the
+                // overlap were never counted in (C's double-count adjust).
+                let overlap = self.commit_mask.intersect(&mask);
+                crate::stats::STATS
+                    .committed
+                    .increase(full_size - overlap.committed_size(SEGMENT_SIZE));
+                // SAFETY: purged ranges hold no live blocks (callers
+                // guarantee); decommitted ranges recommit on next use.
+                unsafe { os::decommit(start, full_size) };
+                self.commit_mask.clear(&mask);
+            } else {
+                // SAFETY: purged ranges hold no live blocks (callers guarantee).
+                unsafe { os::reset(start, full_size) };
+            }
         }
         self.purge_mask.clear(&mask);
     }
@@ -1055,8 +1076,9 @@ fn segment_os_free(segment: &Segment, tld: &SegmentsTld) {
         MemSource::Arena(aref) => {
             // Returning blocks only flips bitmap bits — no dealloc happens
             // while references into the segment are still on the stack.
-            // Stat-neutral: the blocks stay OS-committed in the arena.
-            crate::arena::free(aref);
+            // Stat-neutral when fully committed: the blocks stay
+            // OS-committed in the arena.
+            crate::arena::free(aref, segment.commit_mask.is_full(), csize);
         }
         MemSource::Os => {
             // Cache standard segments for syscall-free reuse (the mapping

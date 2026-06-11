@@ -40,6 +40,7 @@ options! {
     MaxSegmentReclaim => max_segment_reclaim: 10, "MIMALLOC_MAX_SEGMENT_RECLAIM";
     AbandonedReclaimOnFree => abandoned_reclaim_on_free: 0, "MIMALLOC_ABANDONED_RECLAIM_ON_FREE";
     TargetSegmentsPerThread => target_segments_per_thread: 0, "MIMALLOC_TARGET_SEGMENTS_PER_THREAD";
+    PurgeDecommits => purge_decommits: 1, "MIMALLOC_PURGE_DECOMMITS";
     ArenaReserve => arena_reserve: 1024 * 1024, "MIMALLOC_ARENA_RESERVE"; // KiB
     ShowErrors => show_errors: 0, "MIMALLOC_SHOW_ERRORS";
     ShowStats => show_stats: 0, "MIMALLOC_SHOW_STATS";
