@@ -125,6 +125,9 @@ impl OsMem {
         if p.is_null() {
             return None;
         }
+        if commit {
+            crate::stats::STATS.committed.increase(size);
+        }
         if p.addr() & (alignment - 1) == 0 {
             p.expose_provenance(); // segment lookups reconstruct pointers by address
             return Some((
@@ -139,12 +142,18 @@ impl OsMem {
             ));
         }
         // Misaligned: over-allocate and trim both ends.
+        if commit {
+            crate::stats::STATS.committed.decrease(size);
+        }
         // SAFETY: p..p+size is our mapping.
         unsafe { libc::munmap(p.cast(), size) };
         let over = size + alignment;
         let p = mmap(ptr::null_mut(), over, commit);
         if p.is_null() {
             return None;
+        }
+        if commit {
+            crate::stats::STATS.committed.increase(size);
         }
         let aligned =
             ptr::with_exposed_provenance_mut::<u8>((p.addr() + alignment - 1) & !(alignment - 1));
@@ -187,6 +196,7 @@ impl OsMem {
 #[cfg(not(miri))]
 pub unsafe fn commit(p: *mut u8, size: usize) -> bool {
     let (p, size) = page_span(p, size, true);
+    crate::stats::STATS.committed.increase(size);
     SYSCALL_COUNTS[3].fetch_add(1, Ordering::Relaxed);
     // SAFETY: caller guarantees the range is within an owned mapping.
     unsafe { libc::mprotect(p.cast(), size, libc::PROT_READ | libc::PROT_WRITE) };
@@ -205,6 +215,7 @@ pub unsafe fn decommit(p: *mut u8, size: usize) {
     if size == 0 {
         return;
     }
+    crate::stats::STATS.committed.decrease(size);
     // SAFETY: per caller contract; MAP_FIXED re-map keeps the reservation.
     unsafe {
         libc::mmap(

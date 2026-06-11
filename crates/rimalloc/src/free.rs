@@ -108,7 +108,7 @@ fn free_generic_local(page: &Page, p: *mut u8) {
     let block = if page.has_aligned() {
         page_ptr_unalign(page, p)
     } else {
-        p.cast()
+        Block::at(p)
     };
     free_block_local(page, block, true);
 }
@@ -198,7 +198,7 @@ pub fn free(p: *mut u8) {
     let page = segment.page_of(p);
     if is_local {
         if !page.full_or_aligned() {
-            free_block_local(page, p.cast(), false);
+            free_block_local(page, Block::at(p), false);
         } else {
             free_generic_local(page, p);
         }

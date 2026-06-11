@@ -195,9 +195,20 @@ fn arena_reserve() -> Option<&'static Arena> {
 }
 
 fn arena_reserve_locked() -> Option<&'static Arena> {
+    // MIMALLOC_ARENA_RESERVE (KiB) sets the base reservation; 0 disables
+    // arena reservation entirely (allocation falls back to the OS and the
+    // segment cache).
+    let reserve = crate::options::arena_reserve().max(0) as usize * 1024;
+    if reserve == 0 {
+        return None;
+    }
     let n = ARENA_COUNT.load(Ordering::Acquire);
-    // 1 GiB, doubling every 2 arenas, capped at MAX_ARENA_BLOCKS.
-    let base_blocks = if cfg!(miri) { 2 } else { 32 }; // miri: small host allocs
+    // base reservation, doubling every 2 arenas, capped at MAX_ARENA_BLOCKS.
+    let base_blocks = if cfg!(miri) {
+        2 // miri: small host allocs
+    } else {
+        reserve.div_ceil(ARENA_BLOCK_SIZE).max(1)
+    };
     let blocks = (base_blocks << (n / 2)).min(MAX_ARENA_BLOCKS);
     let size = blocks * ARENA_BLOCK_SIZE;
     // Reserve uncommitted; blocks are committed on first claim.

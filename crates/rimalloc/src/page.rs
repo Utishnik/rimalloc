@@ -27,10 +27,10 @@ pub struct Block {
 }
 
 impl Block {
-    /// # Safety
-    /// `p` must point to a free block inside a page (its memory is unused).
+    /// View a user pointer as a block pointer (a plain cast; any
+    /// dereference remains the caller's obligation).
     #[inline(always)]
-    pub unsafe fn at(p: *mut u8) -> *mut Block {
+    pub fn at(p: *mut u8) -> *mut Block {
         p.cast()
     }
 
@@ -84,10 +84,6 @@ impl Delayed {
 pub struct ThreadFree(pub usize);
 
 impl ThreadFree {
-    #[inline(always)]
-    pub fn make(block: *mut Block, delayed: Delayed) -> ThreadFree {
-        ThreadFree(block.expose_provenance() | delayed as usize)
-    }
     #[inline(always)]
     pub fn block(self) -> *mut Block {
         ptr::with_exposed_provenance_mut(self.0 & crate::protocol::TF_PTR_MASK)

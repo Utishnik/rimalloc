@@ -395,6 +395,11 @@ impl Segment {
             return true;
         }
         if !self.commit_mask.all_set(&mask) {
+            // adjust for overlap: os::commit re-counts the whole range
+            let overlap = self.commit_mask.intersect(&mask);
+            crate::stats::STATS
+                .committed
+                .decrease(overlap.committed_size(SEGMENT_SIZE));
             // SAFETY: range lies within this segment's mapping.
             unsafe { os::commit(start, full_size) };
             self.commit_mask.set(&mask);
@@ -556,11 +561,9 @@ impl SegmentsTld {
         if delta >= 0 {
             crate::stats::STATS.segments.increase(1);
             crate::stats::STATS.reserved.increase(delta as usize);
-            crate::stats::STATS.committed.increase(delta as usize);
         } else {
             crate::stats::STATS.segments.decrease(1);
             crate::stats::STATS.reserved.decrease((-delta) as usize);
-            crate::stats::STATS.committed.decrease((-delta) as usize);
         }
         let count = self.count.get();
         self.count.set(count.wrapping_add_signed(delta.signum()));
@@ -1033,6 +1036,9 @@ fn segment_alloc<'a>(
 fn segment_os_free(segment: &Segment, tld: &SegmentsTld) {
     segment.thread_id.store(0, Ordering::Relaxed);
     tld.track_size(-(segment.size() as isize));
+    crate::stats::STATS
+        .committed
+        .decrease(segment.commit_mask.committed_size(SEGMENT_SIZE));
     if segment.was_reclaimed.get() {
         tld.reclaim_count.set(tld.reclaim_count.get() - 1);
         segment.was_reclaimed.set(false);
