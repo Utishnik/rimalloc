@@ -135,6 +135,13 @@ mod tsd {
         tcb
     }
 
+    /// Relaxed atomics rather than plain loads/stores: the slot is
+    /// logically thread-private, but it lives inside the pthread struct,
+    /// which libpthread recycles across threads at the same address (reuse
+    /// is ordered inside libpthread, invisibly to TSan). The dying thread's
+    /// final store (`thread_done` via the TSD destructor) would otherwise
+    /// appear to race the first read of a later thread occupying the
+    /// recycled struct. Same single ldr/str on arm64; zero cost.
     pub struct HeapSlot;
     impl HeapSlot {
         #[inline(always)]
@@ -142,13 +149,15 @@ mod tsd {
             // SAFETY: slot 89 of this thread's TSD block is reserved for the
             // allocator (as in C mimalloc on Apple); it is zero on fresh
             // threads, which maps to the static empty heap.
-            let p = unsafe { (*tsd_base().add(HEAP_SLOT)) as *mut Heap };
+            let slot = unsafe { AtomicUsize::from_ptr(tsd_base().add(HEAP_SLOT)) };
+            let p = slot.load(Ordering::Relaxed) as *mut Heap;
             if p.is_null() { empty_heap() } else { p }
         }
         #[inline(always)]
         pub fn set(&self, v: *mut Heap) {
             // SAFETY: as in `get`; only this thread writes its own slot.
-            unsafe { *tsd_base().add(HEAP_SLOT) = v as usize }
+            let slot = unsafe { AtomicUsize::from_ptr(tsd_base().add(HEAP_SLOT)) };
+            slot.store(v as usize, Ordering::Relaxed);
         }
     }
     pub static DEFAULT_HEAP: HeapSlot = HeapSlot;
