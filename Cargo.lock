@@ -198,6 +198,7 @@ dependencies = [
 name = "rimalloc-bench"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "mimalloc",
  "regex",
  "rimalloc",

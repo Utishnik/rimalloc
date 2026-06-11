@@ -422,6 +422,69 @@ fn rimalloc_free_sized(p: *mut u8, size: usize) {
     }
 }
 
+/// Fragmentation probe: build a large mixed working set, free a random
+/// half (Swiss-cheese pattern), then allocate a different size class into
+/// the holes. Reports peak RSS and retained RSS per live byte — external
+/// fragmentation shows up as RSS that stays high after the frees.
+fn bench_frag() -> f64 {
+    fn rss_mb() -> f64 {
+        let mut info = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, info.as_mut_ptr()) };
+        unsafe { info.assume_init() }.ru_maxrss as f64 / (1 << 20) as f64
+    }
+    let mut r = 5usize;
+    // phase 1: ~400MB of mixed small/medium blocks
+    let mut blocks: Vec<(usize, usize)> = (0..400_000)
+        .map(|_| {
+            let size = 16 << (pick(&mut r) % 7); // 16B..1KiB
+            let size = size + pick(&mut r) % size;
+            (rimalloc_alloc(size).addr(), size)
+        })
+        .collect();
+    let live_full: usize = blocks.iter().map(|b| b.1).sum();
+    let peak = rss_mb();
+    // phase 2: free a random half
+    let mut i = 0;
+    blocks.retain(|(a, size)| {
+        i += 1;
+        if i % 2 == pick(&mut r) % 2 {
+            rimalloc_free_sized(std::ptr::with_exposed_provenance_mut(*a), *size);
+            false
+        } else {
+            true
+        }
+    });
+    rimalloc_collect_if_available();
+    let live_half: usize = blocks.iter().map(|b| b.1).sum();
+    // phase 3: different size class into the fragmented heap
+    let refill: Vec<(usize, usize)> = (0..100_000)
+        .map(|_| {
+            let size = 2048 + pick(&mut r) % 6144;
+            (rimalloc_alloc(size).addr(), size)
+        })
+        .collect();
+    let live_refill: usize = refill.iter().map(|b| b.1).sum();
+    let end = rss_mb();
+    println!(
+        "  frag: peak {peak:.0}MB over {:.0}MB live; after half-free + {:.0}MB refill: {end:.0}MB RSS over {:.0}MB live (overhead x{:.2})",
+        live_full as f64 / (1 << 20) as f64,
+        live_refill as f64 / (1 << 20) as f64,
+        (live_half + live_refill) as f64 / (1 << 20) as f64,
+        end / ((live_half + live_refill) as f64 / (1 << 20) as f64),
+    );
+    for (a, size) in blocks.into_iter().chain(refill) {
+        rimalloc_free_sized(std::ptr::with_exposed_provenance_mut(a), size);
+    }
+    0.0
+}
+
+#[cfg(feature = "alloc-rimalloc")]
+fn rimalloc_collect_if_available() {
+    rimalloc::collect(true);
+}
+#[cfg(not(feature = "alloc-rimalloc"))]
+fn rimalloc_collect_if_available() {}
+
 fn main() {
     let which = std::env::args().nth(1).unwrap_or_else(|| "all".into());
     let name = if cfg!(feature = "alloc-rimalloc") {
@@ -453,4 +516,5 @@ fn main() {
     run("xpipe", bench_xpipe);
     run("xring", bench_xring);
     run("scratch", bench_cache_scratch);
+    run("frag", bench_frag);
 }
