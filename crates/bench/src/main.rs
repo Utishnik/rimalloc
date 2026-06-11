@@ -429,8 +429,13 @@ fn rimalloc_free_sized(p: *mut u8, size: usize) {
 fn bench_frag() -> f64 {
     fn rss_mb() -> f64 {
         let mut info = std::mem::MaybeUninit::<libc::rusage>::uninit();
-        unsafe { libc::getrusage(libc::RUSAGE_SELF, info.as_mut_ptr()) };
-        unsafe { info.assume_init() }.ru_maxrss as f64 / (1 << 20) as f64
+        // SAFETY: getrusage fills the struct; assume_init only after success.
+        unsafe {
+            libc::getrusage(libc::RUSAGE_SELF, info.as_mut_ptr());
+            info.assume_init()
+        }
+        .ru_maxrss as f64
+            / (1 << 20) as f64
     }
     let mut r = 5usize;
     // phase 1: ~400MB of mixed small/medium blocks
