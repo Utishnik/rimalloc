@@ -1675,6 +1675,70 @@ pub fn abandoned_collect(heap: &Heap, force: bool, tld: &SegmentsTld) {
 // Page allocation entry points
 // ---------------------------------------------------------------------------
 
+/// `mi_segment_force_abandon`: abandon every used page of `segment` so the
+/// segment becomes reclaimable by other threads. The pages may be freed in
+/// the process; `dont_free` keeps the segment metadata valid throughout.
+fn segment_force_abandon(segment: &Segment) {
+    debug_assert!(!segment.is_abandoned());
+    segment.dont_free.set(true);
+    let (start, end) = slices_start_iterate(segment);
+    let mut p = start;
+    while p < end {
+        // SAFETY: span heads partition the slices array.
+        let mut slice = unsafe { &*p };
+        if slice.slice_is_used() {
+            let page = slice.slice_first();
+            crate::page_ops::page_free_collect(page, false);
+            if segment.used.get() == segment.abandoned.get() + 1 {
+                // last in-use page: after abandoning it the segment itself
+                // is abandoned and must not be touched again.
+                segment.dont_free.set(false);
+                crate::page_ops::page_force_abandon(page);
+                return;
+            }
+            crate::page_ops::page_force_abandon(page);
+            // the page may have been freed and coalesced backward; restart
+            // from the (possibly merged) span head before advancing.
+            slice = slice.slice_first();
+        }
+        let next = segment.slice_index(slice) + slice.slice_count.get() as usize;
+        // SAFETY: span heads stay within the slices array.
+        p = unsafe { segment.slices.as_ptr().add(next) };
+    }
+    segment.dont_free.set(false);
+}
+
+/// `mi_segments_try_abandon`: when over the per-thread segment target,
+/// abandon full-bin segments to increase cross-thread reuse.
+fn segments_try_abandon(heap: &Heap, tld: &SegmentsTld) {
+    let target = options::target_segments_per_thread();
+    if target <= 0 || tld.count.get() < target as usize {
+        return;
+    }
+    let target = target as usize;
+    let min_target = if target > 4 { target * 3 / 4 } else { target };
+    // Only full-bin pages hold candidate segments (mirrors C's heuristic of
+    // not maintaining a per-thread segment list).
+    for _ in 0..64 {
+        if tld.count.get() < min_target {
+            break;
+        }
+        let mut p = heap.pages[crate::constants::BIN_FULL].first.get();
+        // SAFETY: queue nodes are live pages of this heap.
+        while let Some(page) = unsafe { p.as_ref() } {
+            if page.block_size() <= LARGE_OBJ_SIZE_MAX {
+                break;
+            }
+            p = page.next.get();
+        }
+        // SAFETY: queue nodes are live pages of this heap.
+        let Some(page) = (unsafe { p.as_ref() }) else {
+            break;
+        };
+        segment_force_abandon(page.segment());
+    }
+}
+
 /// `mi_segment_reclaim_or_alloc`
 fn reclaim_or_alloc<'a>(
     heap: &Heap,
@@ -1683,6 +1747,8 @@ fn reclaim_or_alloc<'a>(
     tld: &SegmentsTld,
 ) -> Option<&'a Segment> {
     debug_assert!(block_size <= LARGE_OBJ_SIZE_MAX);
+    // Shed excess segments first so other threads can reclaim them.
+    segments_try_abandon(heap, tld);
     let mut reclaimed = false;
     let segment = try_reclaim(heap, needed_slices, block_size, &mut reclaimed, tld);
     if reclaimed {

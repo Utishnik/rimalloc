@@ -268,7 +268,6 @@ pub fn page_abandon(page: &Page, pq: &PageQueue) {
 }
 
 /// `_mi_page_force_abandon` (used by `segments_try_abandon`, not yet ported)
-#[allow(dead_code)]
 pub fn page_force_abandon(page: &Page) {
     // SAFETY: owning thread; heap is live.
     let heap = unsafe { &*page.heap() };
