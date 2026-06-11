@@ -533,7 +533,7 @@ fn find_free_page(heap: &Heap, size: usize) -> Option<&Page> {
 
 /// `mi_large_huge_page_alloc`
 fn large_huge_page_alloc(heap: &Heap, size: usize, page_alignment: usize) -> Option<&Page> {
-    let block_size = align_up(size, MAX_ALIGN_SIZE); // `_mi_os_good_alloc_size` is identity below page granularity here
+    let block_size = crate::os::good_alloc_size(size);
     let is_huge = block_size > LARGE_OBJ_SIZE_MAX || page_alignment > 0;
     let pq = heap.page_queue(if is_huge {
         LARGE_OBJ_SIZE_MAX + 1

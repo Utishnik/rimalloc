@@ -220,6 +220,27 @@ pub unsafe fn decommit(p: *mut u8, size: usize) {
     }
 }
 
+/// `_mi_os_good_alloc_size`: round a large allocation up to a tier-aligned
+/// size, so `usable_size` of a large/huge block equals `good_size` (C parity).
+pub fn good_alloc_size(size: usize) -> usize {
+    let align = if size < 512 * 1024 {
+        page_size()
+    } else if size < 2 * 1024 * 1024 {
+        64 * 1024
+    } else if size < 8 * 1024 * 1024 {
+        256 * 1024
+    } else if size < 32 * 1024 * 1024 {
+        1024 * 1024
+    } else {
+        4 * 1024 * 1024
+    };
+    if size >= usize::MAX - align {
+        size
+    } else {
+        crate::constants::align_up(size, align)
+    }
+}
+
 /// Purge: release physical pages but keep the range accessible (`MADV_FREE`).
 ///
 /// # Safety
