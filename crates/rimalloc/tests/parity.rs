@@ -109,3 +109,41 @@ fn registered_hooks_fire() {
     mi::register_output(None, std::ptr::null_mut());
     mi::register_error(None, std::ptr::null_mut());
 }
+
+#[test]
+fn exclusive_arena_never_escapes_to_os() {
+    // A 64 MiB exclusive arena holds exactly 2 segment blocks. A heap bound
+    // to it must (a) serve multi-block huge segments from the arena (sizes
+    // rounded up to whole blocks) and (b) return null once the arena is
+    // exhausted, never falling back to OS memory: this regressed into an
+    // infinite segment-allocation loop before segment_os_alloc refused the
+    // OS fallback for bound heaps.
+    const MIB: usize = 1024 * 1024;
+    let arena = mi::reserve_os_memory(64 * MIB, true, true).expect("arena");
+    let heap = mi::heap_new_in_arena(arena).expect("heap");
+
+    let big = mi::heap_malloc(heap, 40 * MIB); // 2-block arena claim
+    assert!(!big.is_null() && mi::is_in_heap_region(big));
+    unsafe { big.write_bytes(1, 64) };
+    mi::free(big);
+
+    let pinned: Vec<_> = (0..6).map(|_| mi::heap_malloc(heap, 10 * MIB)).collect();
+    assert!(
+        pinned
+            .iter()
+            .all(|&p| !p.is_null() && mi::is_in_heap_region(p))
+    );
+
+    // arena exhausted: large and huge requests fail instead of escaping
+    assert!(mi::heap_malloc(heap, 10 * MIB).is_null());
+    assert!(mi::heap_malloc(heap, 40 * MIB).is_null());
+
+    for p in pinned {
+        mi::free(p);
+    }
+    // blocks returned: the arena serves the bound heap again
+    let p = mi::heap_malloc(heap, 10 * MIB);
+    assert!(!p.is_null() && mi::is_in_heap_region(p));
+    mi::free(p);
+    mi::heap_delete(heap);
+}

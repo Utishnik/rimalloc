@@ -845,11 +845,16 @@ fn segment_os_alloc<'a>(
     let segment_size = segment_slices * SEGMENT_SLICE_SIZE;
     // Prefer the arenas for standard-aligned allocations (syscall-free
     // reuse, batched purging); fall back to the OS segment cache / mmap.
+    // Heaps bound to a specific arena always try it, rounding odd huge
+    // sizes up to whole blocks.
     if align_offset == 0
         && alignment == SEGMENT_ALIGN
-        && segment_size.is_multiple_of(crate::arena::ARENA_BLOCK_SIZE)
-        && let Some((p, is_zero, aref)) =
-            crate::arena::alloc(segment_size / crate::arena::ARENA_BLOCK_SIZE, req_arena)
+        && (segment_size.is_multiple_of(crate::arena::ARENA_BLOCK_SIZE)
+            || req_arena != crate::arena::ARENA_ID_NONE)
+        && let Some((p, is_zero, aref)) = crate::arena::alloc(
+            segment_size.div_ceil(crate::arena::ARENA_BLOCK_SIZE),
+            req_arena,
+        )
     {
         let mem = OsMem {
             base: p,
@@ -880,6 +885,15 @@ fn segment_os_alloc<'a>(
         segment.free_is_zero.set(is_zero);
         tld.track_size(segment_size as isize);
         return Some((segment, segment_slices));
+    }
+    // A heap bound to a specific arena must never fall back to the OS
+    // (mirrors `_mi_arena_alloc_aligned`, which fails with ENOMEM when an
+    // arena id is requested): pages of an OS segment are not
+    // `memid_suitable` for such a heap, so `segments_page_alloc` would loop
+    // forever allocating segments it can never use — and a huge page would
+    // silently escape the reservation.
+    if req_arena != crate::arena::ARENA_ID_NONE {
+        return None;
     }
     // Allocate so that `base + align_offset` is `alignment`-aligned.
     let (p, mem) = if align_offset == 0 {
