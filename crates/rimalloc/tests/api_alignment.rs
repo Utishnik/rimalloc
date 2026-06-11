@@ -12,7 +12,10 @@ fn global_alloc_honors_align16_for_tiny_sizes() {
     for size in 1..=16usize {
         for &align in &[8usize, 16, 32, 64] {
             let layout = Layout::from_size_align(size, align).unwrap();
-            for _ in 0..256 {
+            // Miri interprets every allocation; a few iterations exercise the
+            // same routing the native run hammers 256x.
+            let iters = if cfg!(miri) { 4 } else { 256 };
+            for _ in 0..iters {
                 let p = unsafe { a.alloc(layout) };
                 assert!(!p.is_null());
                 assert_eq!(p.addr() % align, 0, "size {size} align {align}: {:p}", p);
