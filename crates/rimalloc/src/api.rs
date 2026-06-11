@@ -116,6 +116,11 @@ fn heap_realloc_zero(heap: &Heap, p: *mut u8, newsize: usize, zero: bool) -> *mu
     }
     let newp = as_ptr(heap_malloc_zero(heap, newsize, false));
     if !newp.is_null() {
+        if newsize == 0 {
+            // applications expect zero-reallocation to be zeroed (C issue #725).
+            // SAFETY: a zero-size block still has a usable first byte.
+            unsafe { newp.write(0) };
+        }
         realloc_move(p, newp, size, newsize, zero);
     }
     newp
@@ -331,12 +336,21 @@ fn realloc_zero_aligned_at(
     if p.is_null() {
         return malloc_zero_aligned_at(heap_default_unchecked(), newsize, alignment, offset, zero);
     }
-    if (p.addr() + offset).is_multiple_of(alignment) && newsize <= usable_size(p) {
-        return p; // still fits and aligned
+    let size = usable_size(p);
+    // still fits, aligned, and not more than ~25% waste (matches C)?
+    if newsize <= size
+        && newsize >= size - size / 2
+        && (p.addr() + offset).is_multiple_of(alignment)
+    {
+        return p;
     }
     let newp = malloc_zero_aligned_at(heap_default_unchecked(), newsize, alignment, offset, zero);
     if !newp.is_null() {
-        realloc_move(p, newp, usable_size(p), newsize, zero);
+        if newsize == 0 {
+            // SAFETY: a zero-size block still has a usable first byte.
+            unsafe { newp.write(0) };
+        }
+        realloc_move(p, newp, size, newsize, zero);
     }
     newp
 }
@@ -551,7 +565,10 @@ pub struct Rimalloc;
 unsafe impl GlobalAlloc for Rimalloc {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if layout.align() <= MAX_ALIGN_SIZE {
+        // `align <= MAX_ALIGN_SIZE` is NOT sufficient: the 8-byte size class
+        // is only 8-aligned, so a `{size: 1..=8, align: 16}` layout needs the
+        // aligned path. `is_naturally_aligned` is C's exact predicate.
+        if is_naturally_aligned(layout.size(), layout.align()) {
             malloc(layout.size())
         } else {
             malloc_aligned(layout.size(), layout.align())
@@ -565,7 +582,7 @@ unsafe impl GlobalAlloc for Rimalloc {
 
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if layout.align() <= MAX_ALIGN_SIZE {
+        if is_naturally_aligned(layout.size(), layout.align()) {
             zalloc(layout.size())
         } else {
             zalloc_aligned(layout.size(), layout.align())
@@ -574,7 +591,7 @@ unsafe impl GlobalAlloc for Rimalloc {
 
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if layout.align() <= MAX_ALIGN_SIZE {
+        if is_naturally_aligned(new_size, layout.align()) {
             realloc(ptr, new_size)
         } else {
             realloc_aligned(ptr, new_size, layout.align())

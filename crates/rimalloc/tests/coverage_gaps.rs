@@ -176,8 +176,15 @@ fn realloc_aligned_paths() {
     let p = mi::realloc_aligned(std::ptr::null_mut(), 100, 256);
     assert!(!p.is_null() && p.addr().is_multiple_of(256));
     unsafe { p.write_bytes(0x5A, 100) };
-    // still fits and aligned -> same pointer
-    assert_eq!(mi::realloc_aligned(p, 64, 256), p);
+    // shrink within the keep window (>= half the usable size) -> same pointer
+    let usable = mi::usable_size(p);
+    assert_eq!(mi::realloc_aligned(p, usable - usable / 4, 256), p);
+    // shrink wasting more than half -> reallocates to a smaller, aligned block
+    let small = mi::realloc_aligned(p, 8, 256);
+    assert!(small.addr().is_multiple_of(256) && mi::usable_size(small) < usable);
+    let p = mi::realloc_aligned(small, 100, 256);
+    assert!(p.addr().is_multiple_of(256));
+    unsafe { p.write_bytes(0x5A, 100) };
     // grow -> move, contents preserved
     let q = mi::realloc_aligned(p, 64 * 1024, 256);
     assert!(!q.is_null() && q.addr().is_multiple_of(256));
