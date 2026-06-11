@@ -137,6 +137,12 @@ impl Arena {
         if was_committed != mask {
             // SAFETY: the claimed range is exclusively ours.
             unsafe { os::commit(self.block_ptr(index), count * ARENA_BLOCK_SIZE) };
+            // os::commit counted the whole range; the already-committed
+            // blocks never left the stat (arena frees are stat-neutral),
+            // so subtract them (C's `stat_commit_size`).
+            crate::stats::STATS
+                .committed
+                .decrease((was_committed.count_ones() as usize) * ARENA_BLOCK_SIZE);
         }
         let is_zero = was_dirty == 0;
         (is_zero, true)

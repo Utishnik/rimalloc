@@ -679,6 +679,14 @@ pub fn zalloc_small(size: usize) -> *mut u8 {
     ))
 }
 
+/// Current committed-byte count from the stats (diagnostic).
+pub fn stats_committed_current() -> i64 {
+    crate::stats::STATS
+        .committed
+        .current
+        .load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Syscall counters `[mmap, munmap, madvise, mprotect]` (diagnostics).
 pub fn os_syscall_counts() -> [usize; 4] {
     crate::os::syscall_counts()

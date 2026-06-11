@@ -1036,9 +1036,7 @@ fn segment_alloc<'a>(
 fn segment_os_free(segment: &Segment, tld: &SegmentsTld) {
     segment.thread_id.store(0, Ordering::Relaxed);
     tld.track_size(-(segment.size() as isize));
-    crate::stats::STATS
-        .committed
-        .decrease(segment.commit_mask.committed_size(SEGMENT_SIZE));
+    let csize = segment.commit_mask.committed_size(SEGMENT_SIZE);
     if segment.was_reclaimed.get() {
         tld.reclaim_count.set(tld.reclaim_count.get() - 1);
         segment.was_reclaimed.set(false);
@@ -1057,15 +1055,18 @@ fn segment_os_free(segment: &Segment, tld: &SegmentsTld) {
         MemSource::Arena(aref) => {
             // Returning blocks only flips bitmap bits — no dealloc happens
             // while references into the segment are still on the stack.
+            // Stat-neutral: the blocks stay OS-committed in the arena.
             crate::arena::free(aref);
         }
         MemSource::Os => {
-            // Cache standard segments for syscall-free reuse; otherwise
+            // Cache standard segments for syscall-free reuse (the mapping
+            // stays committed: stat-neutral until eviction); otherwise
             // defer the unmap since references into the segment may still
             // be on the call stack.
             let mem = memid.mem;
             let standard = mem.size == SEGMENT_SIZE && mem.base.addr() & SEGMENT_MASK == 0;
-            if !os::cache_push(mem, standard) {
+            if !os::cache_push(mem, standard, csize) {
+                crate::stats::STATS.committed.decrease(csize);
                 os::defer_free(mem);
             }
         }

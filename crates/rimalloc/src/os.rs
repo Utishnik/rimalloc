@@ -375,7 +375,7 @@ fn cache_locked<R>(f: impl FnOnce() -> R) -> R {
 
 /// Try to cache a standard segment region; false if the cache is full or the
 /// region is non-standard.
-pub fn cache_push(mem: OsMem, standard: bool) -> bool {
+pub fn cache_push(mem: OsMem, standard: bool, committed_size: usize) -> bool {
     if !standard || CACHE.count.load(Ordering::Relaxed) >= CACHE_MAX {
         return false;
     }
@@ -384,6 +384,9 @@ pub fn cache_push(mem: OsMem, standard: bool) -> bool {
     if !mem.is_committed {
         // SAFETY: we own the dead region.
         unsafe { commit(mem.base, mem.size) };
+        // commit() counted the whole range; the caller's already-committed
+        // bytes never left the stat.
+        crate::stats::STATS.committed.decrease(committed_size);
     }
     // SAFETY: dead region, fully committed above.
     let node = unsafe { tail_node::<CachedRegion>(&mem) };
