@@ -18,16 +18,23 @@ fn target_segments_sheds_and_reuses() {
     // then keep allocating: the target trigger must abandon excess segments
     // rather than growing unboundedly. We assert it stays alive and the
     // freed memory round-trips through abandonment.
+    // Miri interprets every allocation, so scale the working set down there
+    // (the abandon/reclaim code paths still run, just over fewer blocks).
+    let (n, keep, threads_n) = if cfg!(miri) {
+        (200usize, 180usize, 400usize)
+    } else {
+        (4000, 3900, 8000)
+    };
     let mut live: Vec<*mut u8> = Vec::new();
     for round in 0..8 {
-        for _ in 0..4000 {
+        for _ in 0..n {
             let p = rimalloc::malloc(4096);
             assert!(!p.is_null());
             unsafe { p.write_bytes(round as u8, 64) };
             live.push(p);
         }
         // Free most, retain a few per round to keep churn realistic.
-        for p in live.drain(..3900) {
+        for p in live.drain(..keep) {
             rimalloc::free(p);
         }
         rimalloc::collect(false);
@@ -39,7 +46,7 @@ fn target_segments_sheds_and_reuses() {
     // A second thread must be able to reclaim what the first abandoned.
     let (tx, rx) = mpsc::channel::<usize>();
     let h = std::thread::spawn(move || {
-        let mut ps: Vec<*mut u8> = (0..8000).map(|_| rimalloc::malloc(4096)).collect();
+        let mut ps: Vec<*mut u8> = (0..threads_n).map(|_| rimalloc::malloc(4096)).collect();
         for &p in &ps {
             assert!(!p.is_null());
         }
@@ -48,7 +55,7 @@ fn target_segments_sheds_and_reuses() {
             rimalloc::free(p);
         }
     });
-    assert_eq!(rx.recv().unwrap(), 8000);
+    assert_eq!(rx.recv().unwrap(), threads_n);
     h.join().unwrap();
     rimalloc::collect(true);
 }
