@@ -142,18 +142,12 @@ impl OsMem {
             ));
         }
         // Misaligned: over-allocate and trim both ends.
-        if commit {
-            crate::stats::STATS.committed.decrease(size);
-        }
         // SAFETY: p..p+size is our mapping.
         unsafe { libc::munmap(p.cast(), size) };
         let over = size + alignment;
         let p = mmap(ptr::null_mut(), over, commit);
         if p.is_null() {
             return None;
-        }
-        if commit {
-            crate::stats::STATS.committed.increase(size);
         }
         let aligned =
             ptr::with_exposed_provenance_mut::<u8>((p.addr() + alignment - 1) & !(alignment - 1));
@@ -196,7 +190,6 @@ impl OsMem {
 #[cfg(not(miri))]
 pub unsafe fn commit(p: *mut u8, size: usize) -> bool {
     let (p, size) = page_span(p, size, true);
-    crate::stats::STATS.committed.increase(size);
     SYSCALL_COUNTS[3].fetch_add(1, Ordering::Relaxed);
     // SAFETY: caller guarantees the range is within an owned mapping.
     unsafe { libc::mprotect(p.cast(), size, libc::PROT_READ | libc::PROT_WRITE) };
@@ -214,7 +207,6 @@ pub unsafe fn decommit(p: *mut u8, size: usize) {
     if size == 0 {
         return;
     }
-    crate::stats::STATS.committed.decrease(size);
     // SAFETY: per caller contract; MAP_FIXED re-map keeps the reservation.
     unsafe {
         libc::mmap(
@@ -302,7 +294,6 @@ pub fn defer_free(mem: OsMem) {
     let node = unsafe {
         let node = tail_node::<PendingFree>(&mem);
         commit(node.cast(), 64);
-        crate::stats::STATS.committed.decrease(page_size());
         node
     };
     let mut head = PENDING.load(Ordering::Relaxed);
@@ -375,7 +366,7 @@ fn cache_locked<R>(f: impl FnOnce() -> R) -> R {
 
 /// Try to cache a standard segment region; false if the cache is full or the
 /// region is non-standard.
-pub fn cache_push(mem: OsMem, standard: bool, committed_size: usize) -> bool {
+pub fn cache_push(mem: OsMem, standard: bool) -> bool {
     if !standard || CACHE.count.load(Ordering::Relaxed) >= CACHE_MAX {
         return false;
     }
@@ -385,9 +376,6 @@ pub fn cache_push(mem: OsMem, standard: bool, committed_size: usize) -> bool {
     if !mem.is_committed || crate::options::purge_decommits() != 0 {
         // SAFETY: we own the dead region.
         unsafe { commit(mem.base, mem.size) };
-        // commit() counted the whole range; the caller's already-committed
-        // bytes never left the stat.
-        crate::stats::STATS.committed.decrease(committed_size);
     }
     // SAFETY: dead region, fully committed above.
     let node = unsafe { tail_node::<CachedRegion>(&mem) };

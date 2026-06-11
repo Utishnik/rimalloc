@@ -137,12 +137,6 @@ impl Arena {
         if was_committed != mask {
             // SAFETY: the claimed range is exclusively ours.
             unsafe { os::commit(self.block_ptr(index), count * ARENA_BLOCK_SIZE) };
-            // os::commit counted the whole range; the already-committed
-            // blocks never left the stat (arena frees are stat-neutral),
-            // so subtract them (C's `stat_commit_size`).
-            crate::stats::STATS
-                .committed
-                .decrease((was_committed.count_ones() as usize) * ARENA_BLOCK_SIZE);
         }
         let is_zero = was_dirty == 0;
         (is_zero, true)
@@ -418,21 +412,20 @@ pub fn contains(p: *const u8) -> bool {
 }
 
 /// Return blocks to their arena.
-pub fn free(aref: ArenaRef, all_committed: bool, committed_size: usize) {
+pub fn free(aref: ArenaRef, all_committed: bool) {
     // SAFETY: arenas are immortal.
     let arena = unsafe { &*aref.arena };
     if !all_committed {
         // The dying segment decommitted parts of this range (the arena
         // tracks commitment at block granularity): mark the whole range
         // uncommitted so the next claim recommits it (C `_mi_arena_free`),
-        // and count out the bytes that were still committed.
+        // preventing a re-claim from handing out PROT_NONE memory.
         let (fi, bit) = (
             aref.index as usize / FIELD_BITS,
             aref.index as usize % FIELD_BITS,
         );
         arena.blocks_committed[fi]
             .fetch_and(!field_mask(bit, aref.count as usize), Ordering::AcqRel);
-        crate::stats::STATS.committed.decrease(committed_size);
     }
     arena.release(aref.index as usize, aref.count as usize);
 }

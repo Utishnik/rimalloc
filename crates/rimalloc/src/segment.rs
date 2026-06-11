@@ -112,16 +112,6 @@ impl CommitMask {
         core::array::from_fn(|i| self.mask[i].get())
     }
 
-    /// `_mi_commit_mask_committed_size`
-    pub fn committed_size(&self, total: usize) -> usize {
-        debug_assert!(total.is_multiple_of(COMMIT_MASK_BITS));
-        let ones: usize = self
-            .mask
-            .iter()
-            .map(|f| f.get().count_ones() as usize)
-            .sum();
-        (total / COMMIT_MASK_BITS) * ones
-    }
     /// Iterate maximal runs of set bits as `(bit_index, bit_count)`.
     pub fn for_each_run(&self, mut f: impl FnMut(usize, usize)) {
         let mut idx = 0;
@@ -395,11 +385,6 @@ impl Segment {
             return true;
         }
         if !self.commit_mask.all_set(&mask) {
-            // adjust for overlap: os::commit re-counts the whole range
-            let overlap = self.commit_mask.intersect(&mask);
-            crate::stats::STATS
-                .committed
-                .decrease(overlap.committed_size(SEGMENT_SIZE));
             // SAFETY: range lies within this segment's mapping.
             unsafe { os::commit(start, full_size) };
             self.commit_mask.set(&mask);
@@ -441,12 +426,6 @@ impl Segment {
         if self.commit_mask.any_set(&mask) {
             debug_assert!(self.allow_decommit.get());
             if options::purge_decommits() != 0 {
-                // os::decommit counts out the whole range; the holes in the
-                // overlap were never counted in (C's double-count adjust).
-                let overlap = self.commit_mask.intersect(&mask);
-                crate::stats::STATS
-                    .committed
-                    .increase(full_size - overlap.committed_size(SEGMENT_SIZE));
                 // SAFETY: purged ranges hold no live blocks (callers
                 // guarantee); decommitted ranges recommit on next use.
                 unsafe { os::decommit(start, full_size) };
@@ -579,12 +558,19 @@ impl SegmentsTld {
     }
 
     fn track_size(&self, delta: isize) {
+        // `committed` is tracked at whole-segment granularity here, the one
+        // place segments enter and leave. Sub-segment lazy commit and
+        // decommit-purge are not reflected (C tracks those finely by
+        // delegating arena-backed purges to the arena; that routing is a
+        // future parity item).
         if delta >= 0 {
             crate::stats::STATS.segments.increase(1);
             crate::stats::STATS.reserved.increase(delta as usize);
+            crate::stats::STATS.committed.increase(delta as usize);
         } else {
             crate::stats::STATS.segments.decrease(1);
             crate::stats::STATS.reserved.decrease((-delta) as usize);
+            crate::stats::STATS.committed.decrease((-delta) as usize);
         }
         let count = self.count.get();
         self.count.set(count.wrapping_add_signed(delta.signum()));
@@ -1057,7 +1043,6 @@ fn segment_alloc<'a>(
 fn segment_os_free(segment: &Segment, tld: &SegmentsTld) {
     segment.thread_id.store(0, Ordering::Relaxed);
     tld.track_size(-(segment.size() as isize));
-    let csize = segment.commit_mask.committed_size(SEGMENT_SIZE);
     if segment.was_reclaimed.get() {
         tld.reclaim_count.set(tld.reclaim_count.get() - 1);
         segment.was_reclaimed.set(false);
@@ -1076,9 +1061,7 @@ fn segment_os_free(segment: &Segment, tld: &SegmentsTld) {
         MemSource::Arena(aref) => {
             // Returning blocks only flips bitmap bits — no dealloc happens
             // while references into the segment are still on the stack.
-            // Stat-neutral when fully committed: the blocks stay
-            // OS-committed in the arena.
-            crate::arena::free(aref, segment.commit_mask.is_full(), csize);
+            crate::arena::free(aref, segment.commit_mask.is_full());
         }
         MemSource::Os => {
             // Cache standard segments for syscall-free reuse (the mapping
@@ -1087,8 +1070,7 @@ fn segment_os_free(segment: &Segment, tld: &SegmentsTld) {
             // be on the call stack.
             let mem = memid.mem;
             let standard = mem.size == SEGMENT_SIZE && mem.base.addr() & SEGMENT_MASK == 0;
-            if !os::cache_push(mem, standard, csize) {
-                crate::stats::STATS.committed.decrease(csize);
+            if !os::cache_push(mem, standard) {
                 os::defer_free(mem);
             }
         }
