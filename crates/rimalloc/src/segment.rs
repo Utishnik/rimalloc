@@ -250,21 +250,6 @@ impl Segment {
         }
     }
 
-    /// Whether this segment performs its own OS-level purges. Arena-backed
-    /// segments leave purging to the owning arena (C `mi_segment_os_free`'s
-    /// "leave it to the arena"; here the arena schedules a whole-block purge
-    /// on the segment's `arena::free`). An arena block is one whole segment,
-    /// so a sub-segment span purge cannot be represented in the arena's
-    /// block-granular `blocks_purge` while the block is still in use; such
-    /// in-life span purges are therefore folded into the arena's single
-    /// whole-block purge cycle when the segment is freed. Keeping the arena as
-    /// the sole (de)committer of arena memory at block granularity also keeps
-    /// cross-layer commit accounting from underflowing.
-    #[inline]
-    fn purges_at_segment_level(&self) -> bool {
-        matches!(self.memid.get().source, MemSource::Os)
-    }
-
     /// Base address of the segment mapping, carrying provenance over the
     /// whole (exposed) mapping rather than just the header struct.
     #[inline(always)]
@@ -431,7 +416,7 @@ impl Segment {
 
     /// `mi_segment_purge`
     fn purge(&self, p: *mut u8, size: usize) {
-        if !self.allow_purge.get() || !self.purges_at_segment_level() {
+        if !self.allow_purge.get() {
             return;
         }
         let (start, full_size, mask) = self.commit_range_mask(true, p, size);
@@ -455,7 +440,7 @@ impl Segment {
 
     /// `mi_segment_schedule_purge`
     fn schedule_purge(&self, p: *mut u8, size: usize) {
-        if !self.allow_purge.get() || !self.purges_at_segment_level() {
+        if !self.allow_purge.get() {
             return;
         }
         if options::purge_delay() == 0 {
@@ -486,11 +471,7 @@ impl Segment {
 
     /// `mi_segment_try_purge`
     pub fn try_purge(&self, force: bool) {
-        if !self.allow_purge.get()
-            || !self.purges_at_segment_level()
-            || self.purge_expire.get() == 0
-            || self.purge_mask.is_empty()
-        {
+        if !self.allow_purge.get() || self.purge_expire.get() == 0 || self.purge_mask.is_empty() {
             return;
         }
         if !force && options::clock_now() < self.purge_expire.get() {
@@ -581,12 +562,7 @@ impl SegmentsTld {
         // place segments enter and leave. Sub-segment lazy commit and
         // decommit-purge are not reflected.
         //
-        // Arena-backed segments now purge only through the owning arena (see
-        // `Segment::purges_at_segment_level`), so arena memory has a single
-        // (de)commit source of truth — the arena's `blocks_committed` —
-        // removing the cross-layer underflow that a sub-block segment
-        // decommit used to cause. Even so, a *globally exact* committed
-        // counter remains a rats' nest on the OS-segment side: freed OS
+        // A *globally exact* committed counter remains a rats' nest: freed OS
         // segments flow through the global segment cache and the deferred-free
         // list as bare `OsMem` records that have already shed the segment's
         // `commit_mask`, and `cache_push`/`defer_free`/`cache_purge_expired`

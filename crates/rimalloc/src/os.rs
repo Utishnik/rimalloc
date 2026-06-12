@@ -207,6 +207,7 @@ pub unsafe fn decommit(p: *mut u8, size: usize) {
     if size == 0 {
         return;
     }
+    SYSCALL_COUNTS[0].fetch_add(1, Ordering::Relaxed);
     // SAFETY: per caller contract; MAP_FIXED re-map keeps the reservation.
     unsafe {
         libc::mmap(
