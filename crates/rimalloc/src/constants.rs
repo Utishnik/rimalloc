@@ -40,8 +40,10 @@ pub const BLOCK_ALIGNMENT_MAX: usize = SEGMENT_SIZE >> 1;
 /// Maximum slice count for which interior pointers can find their page.
 pub const MAX_SLICE_OFFSET_COUNT: usize = (BLOCK_ALIGNMENT_MAX / SEGMENT_SLICE_SIZE) - 1;
 
-/// We never allocate more than `isize::MAX` (`MI_MAX_ALLOC_SIZE`).
-pub const MAX_ALLOC_SIZE: usize = isize::MAX as usize;
+/// `MI_MAX_ALLOC_SIZE`: largest request the allocator accepts. On 64-bit the
+/// cap keeps a segment's slice count within 32 bits (mimalloc issue #877),
+/// well below `isize::MAX`, so `good_size`'s page round-up cannot overflow.
+pub const MAX_ALLOC_SIZE: usize = SEGMENT_SLICE_SIZE * (u32::MAX as usize - 1);
 
 // Commit mask: one bit per commit chunk (= one slice) of a segment.
 pub const MINIMAL_COMMIT_SIZE: usize = SEGMENT_SLICE_SIZE;
@@ -96,4 +98,17 @@ pub const fn align_down(sz: usize, alignment: usize) -> usize {
 #[inline(always)]
 pub const fn is_power_of_two(x: usize) -> bool {
     x != 0 && x & (x - 1) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `MAX_ALLOC_SIZE` matches C v2.3.2's 64-bit value (issue #877) and stays
+    /// below `isize::MAX` so `good_size`'s page round-up cannot overflow.
+    #[test]
+    fn max_alloc_size_matches_c() {
+        assert_eq!(MAX_ALLOC_SIZE, SEGMENT_SLICE_SIZE * (u32::MAX as usize - 1));
+        assert!(MAX_ALLOC_SIZE < isize::MAX as usize);
+    }
 }

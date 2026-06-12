@@ -53,6 +53,10 @@ fn good_size_clamps() {
     assert!(mi::good_size(100) >= 100);
     assert!(mi::good_size(100 * MIB) >= 100 * MIB);
     assert_eq!(mi::good_size(usize::MAX), usize::MAX); // over MAX_ALLOC_SIZE
+    // Requests above the C v2.3.2 cap (SEGMENT_SLICE_SIZE * (u32::MAX-1),
+    // issue #877) are returned unchanged, not page-rounded — pins the cap.
+    let over_cap = 65536 * (u32::MAX as usize - 1) + 1;
+    assert_eq!(mi::good_size(over_cap), over_cap);
 }
 
 #[test]
