@@ -6,6 +6,10 @@
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicUsize, Ordering};
 
+use crate::bitmap::{
+    FIELD_BITS, claim_run_field, claim_single_field, clear_committed_run, decommit_run, field_mask,
+    prepare_run, purge_field, release_run,
+};
 use crate::constants::*;
 use crate::options;
 use crate::os::{self, OsMem};
@@ -15,7 +19,6 @@ pub const ARENA_BLOCK_SIZE: usize = SEGMENT_SIZE;
 const MAX_ARENAS: usize = 64;
 /// Up to 16 GiB per arena (512 blocks, 8 bitmap fields).
 const MAX_BLOCK_FIELDS: usize = 8;
-const FIELD_BITS: usize = usize::BITS as usize;
 const MAX_ARENA_BLOCKS: usize = MAX_BLOCK_FIELDS * FIELD_BITS;
 
 /// Arena identifier: 0 is "none" (any arena); real ids are `index + 1`.
@@ -51,16 +54,6 @@ static ARENA_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PURGE_EXPIRE: AtomicI64 = AtomicI64::new(0);
 static RESERVE_LOCK: AtomicBool = AtomicBool::new(false);
 
-#[inline]
-fn field_mask(bit: usize, count: usize) -> usize {
-    debug_assert!(count >= 1 && bit + count <= FIELD_BITS);
-    if count == FIELD_BITS {
-        !0
-    } else {
-        ((1usize << count) - 1) << bit
-    }
-}
-
 impl Arena {
     #[inline]
     fn block_ptr(&self, index: usize) -> *mut u8 {
@@ -75,28 +68,9 @@ impl Arena {
         let fields = self.block_count.div_ceil(FIELD_BITS);
         if count == 1 {
             for (i, field) in self.blocks_inuse[..fields].iter().enumerate() {
-                let mut cur = field.load(Ordering::Relaxed);
-                loop {
-                    let limit = (self.block_count - i * FIELD_BITS).min(FIELD_BITS);
-                    let free = !cur
-                        & if limit == FIELD_BITS {
-                            !0
-                        } else {
-                            (1 << limit) - 1
-                        };
-                    if free == 0 {
-                        break;
-                    }
-                    let bit = free.trailing_zeros() as usize;
-                    match field.compare_exchange_weak(
-                        cur,
-                        cur | (1 << bit),
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => return Some(i * FIELD_BITS + bit),
-                        Err(v) => cur = v,
-                    }
+                let limit = (self.block_count - i * FIELD_BITS).min(FIELD_BITS);
+                if let Some(bit) = claim_single_field(field, limit) {
+                    return Some(i * FIELD_BITS + bit);
                 }
             }
             return None;
@@ -107,19 +81,11 @@ impl Arena {
         // multi-block: spinlock + scan within fields
         crate::sync::spin_acquire(&self.claim_lock);
         let mut found = None;
-        'scan: for (i, field) in self.blocks_inuse[..fields].iter().enumerate() {
-            let cur = field.load(Ordering::Relaxed);
+        for (i, field) in self.blocks_inuse[..fields].iter().enumerate() {
             let limit = (self.block_count - i * FIELD_BITS).min(FIELD_BITS);
-            if limit < count {
-                continue;
-            }
-            for bit in 0..=(limit - count) {
-                let mask = field_mask(bit, count);
-                if cur & mask == 0 {
-                    field.fetch_or(mask, Ordering::AcqRel);
-                    found = Some(i * FIELD_BITS + bit);
-                    break 'scan;
-                }
+            if let Some(bit) = claim_run_field(field, limit, count) {
+                found = Some(i * FIELD_BITS + bit);
+                break;
             }
         }
         crate::sync::spin_release(&self.claim_lock);
@@ -129,77 +95,70 @@ impl Arena {
     /// Post-claim bookkeeping: ensure committed, compute zero/commit state.
     fn prepare(&self, index: usize, count: usize) -> (bool, bool) {
         let (fi, bit) = (index / FIELD_BITS, index % FIELD_BITS);
-        debug_assert!(bit + count <= FIELD_BITS);
-        let mask = field_mask(bit, count);
-        let was_dirty = self.blocks_dirty[fi].fetch_or(mask, Ordering::AcqRel) & mask;
-        let was_committed = self.blocks_committed[fi].fetch_or(mask, Ordering::AcqRel) & mask;
-        self.blocks_purge[fi].fetch_and(!mask, Ordering::AcqRel);
-        if was_committed != mask {
-            // SAFETY: the claimed range is exclusively ours.
-            unsafe { os::commit(self.block_ptr(index), count * ARENA_BLOCK_SIZE) };
-        }
-        let is_zero = was_dirty == 0;
+        let is_zero = prepare_run(
+            &self.blocks_dirty[fi],
+            &self.blocks_committed[fi],
+            &self.blocks_purge[fi],
+            bit,
+            count,
+            || {
+                // SAFETY: the claimed range is exclusively ours.
+                unsafe { os::commit(self.block_ptr(index), count * ARENA_BLOCK_SIZE) };
+            },
+        );
         (is_zero, true)
     }
 
     fn release(&self, index: usize, count: usize) {
         let (fi, bit) = (index / FIELD_BITS, index % FIELD_BITS);
-        let mask = field_mask(bit, count);
         // schedule the physical pages for release before making the blocks
         // claimable again
-        self.blocks_purge[fi].fetch_or(mask, Ordering::AcqRel);
         let expire = options::clock_now() + options::purge_delay().max(1);
         self.purge_expire.store(expire, Ordering::Relaxed);
         let cur = PURGE_EXPIRE.load(Ordering::Relaxed);
         if cur == 0 || expire < cur {
             PURGE_EXPIRE.store(expire, Ordering::Relaxed);
         }
-        let prev = self.blocks_inuse[fi].fetch_and(!mask, Ordering::AcqRel);
-        debug_assert!(prev & mask == mask);
+        let prev = release_run(&self.blocks_inuse[fi], &self.blocks_purge[fi], bit, count);
+        debug_assert!(prev & field_mask(bit, count) == field_mask(bit, count));
     }
 
     /// Purge scheduled blocks that are still free (best effort; a racing
     /// claim simply refaults).
     fn purge_now(&self) {
         let fields = self.block_count.div_ceil(FIELD_BITS);
+        let decommits = options::purge_decommits() != 0;
         for fi in 0..fields {
-            let pending = self.blocks_purge[fi].swap(0, Ordering::AcqRel);
-            if pending == 0 {
-                continue;
-            }
-            // only purge blocks not (re)claimed since
-            let purgeable = pending & !self.blocks_inuse[fi].load(Ordering::Acquire);
-            let mut m = purgeable;
-            while m != 0 {
-                let bit = m.trailing_zeros() as usize;
-                let run_start = bit;
-                let mut run_len = 0;
-                while bit + run_len < FIELD_BITS && m & (1 << (bit + run_len)) != 0 {
-                    run_len += 1;
-                }
-                let run = field_mask(run_start, run_len);
-                let index = fi * FIELD_BITS + run_start;
-                if options::purge_decommits() != 0 {
-                    // Take the run out of circulation while decommitting:
-                    // a concurrent claim that saw the committed bits set
-                    // must not touch memory mid-decommit. Skip runs that
-                    // were (re)claimed since the purgeable snapshot.
-                    if self.blocks_inuse[fi].fetch_or(run, Ordering::AcqRel) & run == 0 {
-                        self.blocks_committed[fi].fetch_and(!run, Ordering::AcqRel);
-                        // SAFETY: free blocks, exclusively held by us.
+            purge_field(
+                &self.blocks_purge[fi],
+                &self.blocks_inuse[fi],
+                |bit, run_len| {
+                    let index = fi * FIELD_BITS + bit;
+                    if decommits {
+                        // Take the run out of circulation while decommitting:
+                        // a concurrent claim that saw the committed bits set
+                        // must not touch memory mid-decommit. Skip runs that
+                        // were (re)claimed since the purgeable snapshot.
+                        decommit_run(
+                            &self.blocks_inuse[fi],
+                            &self.blocks_committed[fi],
+                            bit,
+                            run_len,
+                            || {
+                                // SAFETY: free blocks, exclusively held by us.
+                                unsafe {
+                                    os::decommit(self.block_ptr(index), run_len * ARENA_BLOCK_SIZE);
+                                }
+                            },
+                        );
+                    } else {
+                        // SAFETY: free blocks; contents may be discarded.
                         unsafe {
-                            os::decommit(self.block_ptr(index), run_len * ARENA_BLOCK_SIZE);
+                            os::reset(self.block_ptr(index), run_len * ARENA_BLOCK_SIZE);
                         }
-                        self.blocks_inuse[fi].fetch_and(!run, Ordering::AcqRel);
                     }
-                } else {
-                    // SAFETY: free blocks; contents may be discarded.
-                    unsafe {
-                        os::reset(self.block_ptr(index), run_len * ARENA_BLOCK_SIZE);
-                    }
-                }
-                m &= !run;
-            }
+                },
+            );
         }
         self.purge_expire.store(0, Ordering::Relaxed);
     }
@@ -424,8 +383,7 @@ pub fn free(aref: ArenaRef, all_committed: bool) {
             aref.index as usize / FIELD_BITS,
             aref.index as usize % FIELD_BITS,
         );
-        arena.blocks_committed[fi]
-            .fetch_and(!field_mask(bit, aref.count as usize), Ordering::AcqRel);
+        clear_committed_run(&arena.blocks_committed[fi], bit, aref.count as usize);
     }
     arena.release(aref.index as usize, aref.count as usize);
 }

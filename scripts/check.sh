@@ -26,6 +26,9 @@ cargo miri test -p rimalloc --tests --lib
 echo "== loom model check (delayed-free protocol) =="
 LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS="--cfg loom" cargo test -p rimalloc --test loom_protocol --release
 
+echo "== loom model check (arena claim/commit/purge bitmap) =="
+LOOM_MAX_PREEMPTIONS=3 RUSTFLAGS="--cfg loom" cargo test -p rimalloc --test loom_arena --release
+
 echo "== fuzz (quick pass; full runs via cargo +nightly fuzz) =="
 if command -v cargo-fuzz >/dev/null 2>&1; then
   (cd crates/rimalloc && cargo +nightly fuzz run alloc_ops -- -runs=20000 -max_len=2048 -rss_limit_mb=6144)

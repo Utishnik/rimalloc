@@ -21,6 +21,7 @@ mod alloc;
 mod api;
 mod arena;
 mod bins;
+pub mod bitmap;
 mod constants;
 mod free;
 mod heap;
