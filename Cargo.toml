@@ -12,6 +12,9 @@ repository = "https://github.com/k/rimalloc"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "allow"
+# `loom` is set by the loom test harness, `fuzzing` by cargo-fuzz — both
+# external to a normal build, so declare them for the unexpected_cfgs lint.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(fuzzing)'] }
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "warn"
