@@ -9,6 +9,100 @@ static ALLOC: rimalloc::Rimalloc = rimalloc::Rimalloc;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(feature = "alloc-stub")]
+#[global_allocator]
+static ALLOC: stub::Stub = stub::Stub;
+
+/// A do-nothing per-thread-freelist allocator: the theoretical floor for the
+/// hot path. Alloc pops a same-size-class block from a thread-local free list
+/// (bump-allocating a fresh 2 MiB chunk on miss); free pushes back. No
+/// cross-thread handling, no segments, no purging, no atomics on the hot
+/// path. NOT a real allocator (cross-thread frees leak; never returns memory)
+/// — exists only to measure how much of each benchmark is irreducible.
+#[cfg(feature = "alloc-stub")]
+mod stub {
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::cell::UnsafeCell;
+
+    const CLASSES: usize = 40; // size classes: round up to next of a small set
+    const CHUNK: usize = 2 * 1024 * 1024;
+
+    struct Tls {
+        free: [*mut u8; CLASSES],
+        bump: *mut u8,
+        bump_end: *mut u8,
+    }
+
+    thread_local! {
+        static TLS: UnsafeCell<Tls> = const {
+            UnsafeCell::new(Tls {
+                free: [std::ptr::null_mut(); CLASSES],
+                bump: std::ptr::null_mut(),
+                bump_end: std::ptr::null_mut(),
+            })
+        };
+    }
+
+    #[inline(always)]
+    fn class_of(size: usize) -> (usize, usize) {
+        // class index and the rounded block size (8-byte granular, geometric).
+        let s = size.max(8);
+        let bits = (usize::BITS - (s - 1).leading_zeros()) as usize;
+        let idx = bits.min(CLASSES - 1);
+        (idx, 1usize << bits.max(3))
+    }
+
+    pub struct Stub;
+    // SAFETY: returns suitably-aligned blocks (power-of-two sized >= align);
+    // a benchmark-only floor, not a production allocator.
+    unsafe impl GlobalAlloc for Stub {
+        #[inline(always)]
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let (idx, bsize) = class_of(layout.size().max(layout.align()));
+            TLS.with(|t| {
+                // SAFETY: thread-local, no reentrancy.
+                let t = unsafe { &mut *t.get() };
+                let head = t.free[idx];
+                if !head.is_null() {
+                    // SAFETY: head is a live freed block; first word is the link.
+                    t.free[idx] = unsafe { *head.cast::<*mut u8>() };
+                    return head;
+                }
+                if t.bump_end.addr() - t.bump.addr() < bsize {
+                    let chunk = CHUNK.max(bsize);
+                    // SAFETY: standard mmap.
+                    let p = unsafe {
+                        libc::mmap(
+                            std::ptr::null_mut(),
+                            chunk,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_PRIVATE | libc::MAP_ANON,
+                            -1,
+                            0,
+                        )
+                    };
+                    t.bump = p.cast();
+                    t.bump_end = t.bump.wrapping_add(chunk);
+                }
+                let p = t.bump;
+                t.bump = t.bump.wrapping_add(bsize);
+                p
+            })
+        }
+        #[inline(always)]
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            let (idx, _) = class_of(layout.size().max(layout.align()));
+            TLS.with(|t| {
+                // SAFETY: thread-local, no reentrancy.
+                let t = unsafe { &mut *t.get() };
+                // SAFETY: ptr is a live block; store the old head as its link.
+                unsafe { *ptr.cast::<*mut u8>() = t.free[idx] };
+                t.free[idx] = ptr;
+            });
+        }
+    }
+}
+
 use std::time::Instant;
 
 fn pick(r: &mut usize) -> usize {
@@ -490,6 +584,15 @@ fn rimalloc_collect_if_available() {
 #[cfg(not(feature = "alloc-rimalloc"))]
 fn rimalloc_collect_if_available() {}
 
+#[cfg(feature = "alloc-rimalloc")]
+fn syscall_counts() -> [usize; 4] {
+    rimalloc::os_syscall_counts()
+}
+#[cfg(not(feature = "alloc-rimalloc"))]
+fn syscall_counts() -> [usize; 4] {
+    [0; 4]
+}
+
 fn main() {
     let which = std::env::args().nth(1).unwrap_or_else(|| "all".into());
     let name = if cfg!(feature = "alloc-rimalloc") {
@@ -504,10 +607,22 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
+    let show_syscalls = std::env::var("BENCH_SYSCALLS").is_ok();
     let run = |bench: &str, f: fn() -> f64| {
         if which == "all" || which == bench {
+            let before = syscall_counts();
             let t = (0..reps).map(|_| f()).fold(f64::INFINITY, f64::min);
-            println!("{bench:>10}: {t:.3}s");
+            if show_syscalls {
+                let after = syscall_counts();
+                let d: Vec<i64> = before
+                    .iter()
+                    .zip(after.iter())
+                    .map(|(b, a)| *a as i64 - *b as i64)
+                    .collect();
+                println!("{bench:>10}: {t:.3}s  syscalls[mmap,munmap,madvise,mprotect]={d:?}");
+            } else {
+                println!("{bench:>10}: {t:.3}s");
+            }
         }
     };
     run("pairs", bench_pairs);

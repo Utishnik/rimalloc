@@ -17,6 +17,7 @@ default = ["alloc-rimalloc"]
 alloc-rimalloc = ["dep:rimalloc"]
 alloc-mimalloc = ["dep:mimalloc"]
 alloc-system = []
+alloc-stub = []
 
 [[bin]]
 name = "bench"
