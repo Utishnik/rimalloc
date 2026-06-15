@@ -7,7 +7,7 @@ exclude = ["crates/rimalloc/fuzz"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/k/rimalloc"
+repository = "https://github.com/moggedhedien/rimalloc"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
