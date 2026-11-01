@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rimalloc", "crates/bench"]
+members = ["crates/rimalloc", "crates/bench", "r3"]
 exclude = ["crates/rimalloc/fuzz"]
 
 [workspace.package]

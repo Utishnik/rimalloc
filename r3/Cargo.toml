@@ -1,0 +1,110 @@
+[package]
+name = "r3"
+version = "0.2.0"
+edition = "2024"
+autobenches = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
+
+[dependencies]
+bumpalo = { version = "3.20", features = ["collections"] }
+core_affinity = "0.8.3"
+crossbeam-utils = "0.8.22"
+hotpath = { version = "0.24.0" }
+rustfs-mimalloc = { version = "0.5.6", optional = true }
+num_cpus = "1.17.0"
+spin = "0.9"
+orx-concurrent-vec = "4"
+boxcar = "0.2"
+triomphe = "0.1"
+branches = { version = "0.5.0", features = ["prefetch"] }
+pprof = { version = "0.13", optional = true, features = ["flamegraph", "protobuf-codec"] }
+
+[features]
+default = ["alloc-mimalloc"]
+pprof = ["dep:pprof"]
+alloc-mimalloc = ["dep:rustfs-mimalloc"]
+# Счётчик grow_fallback + автоподбор chunk size (arena_tune_scan) для
+# bench_arena_profile.sh --tune. Не входит в default: без него бинарь идентичен.
+tune = []
+hotpath = ["hotpath/hotpath"]
+hotpath-cpu = ["hotpath/hotpath-cpu"]
+# Асинхронный prefetch страниц на Windows через PrefetchVirtualMemory.
+# ВЫКЛЮЧЕН по умолчанию: на практике worker-потоки ядра фолтят страницы
+# в чужом контексте (working-set lock, чужая NUMA-нода) и это даёт
+# регрессию. Включается явно: `cargo build --features win-prefetch-pages`.
+win-prefetch-pages = []
+# Huge pages + prefault (трогание памяти). ВЫКЛЮЧЕН по умолчанию.
+# Включение: `cargo build --features huge` (compile-time) ИЛИ
+# `R3_HUGE=1` (runtime, работает и в бинаре без фичи).
+# При активной фиче:
+#   * арены запрашивают huge pages (MAP_HUGETLB / MEM_LARGE_PAGES),
+#     если ОС их даёт;
+#   * prefault (first-touch трогание страниц региона в своей NUMA-ноде,
+#     MADV_POPULATE_WRITE / touch-loop) выполняется только для регионов,
+#     реально лежащих на huge pages.
+# Без фичи и без R3_HUGE=1: обычные 4KB-страницы, prefault не выполняется
+# вообще (в т.ч. блоки hotpath "prefault" не создаются).
+huge = []
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+    "Win32_Security",
+] }
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+divan = "0.1.21"
+
+[[bench]]
+name = "benche"
+harness = false
+
+[[bench]]
+name = "alloc_bench"
+harness = false
+
+# Профильный прогон ТОЛЬКО shared-арены (без spin-мьютекса):
+#   cargo bench --profile profiling --features pprof --bench arena_profile
+# Запускается через скрипт bench_arena_profile.sh (сохраняет .svg + .txt).
+[[bench]]
+name = "arena_profile"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+overflow-checks = false
+incremental = false
+
+[profile.bench]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+[profile.native]
+inherits = "release"
+lto = "fat"
+# Для -Zbuild-std нельзя panic="abort": sysroot-шный panic_abort тянет
+# sysroot-шный core, который дублирует build-std core (E0152). Unwind-ранайм
+# собирается из исходников вместе с остальным std.
+panic = "unwind"
+
+# Отдельный профиль для CPU-профилирования через pprof: debug-символы для
+# нормальных стеков во flamegraph, без strip и LTO.
+# Запуск: cargo run --profile profiling --features pprof
+[profile.profiling]
+inherits = "release"
+debug = true
+lto = false
+strip = false
